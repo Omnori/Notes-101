@@ -5,7 +5,12 @@ const { Client, Collection, Events, GatewayIntentBits, MessageFlags } = require(
 const { token } = require('./config.json');
 
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent]
+});
 
 client.once(Events.ClientReady, (readyClient) => {
     console.log(`Ready! Logged in as ${readyClient.user.tag}`);
@@ -50,5 +55,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } else {
             await interaction.reply({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
         }
+    }
+});
+client.on('message', async message => {
+    // Join the same voice channel of the author of the message
+    console.log(message)
+    if (message.member.voice.channel) {
+        const connection = await message.member.voice.channel.join();
     }
 });
