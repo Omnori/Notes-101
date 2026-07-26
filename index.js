@@ -1,3 +1,5 @@
+require('dotenv').config({ quiet: true });
+
 // Require the necessary discord.js classes
 const fs = require('node:fs');
 const path = require('node:path');
@@ -59,7 +61,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 client.on('message', async message => {
     // Join the same voice channel of the author of the message
-    console.log(message)
     if (message.member.voice.channel) {
         const connection = await message.member.voice.channel.join();
     }
