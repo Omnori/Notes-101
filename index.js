@@ -4,19 +4,34 @@ require('dotenv').config({ quiet: true });
 const fs = require('node:fs');
 const path = require('node:path');
 const { Client, Collection, Events, GatewayIntentBits, MessageFlags } = require('discord.js');
-const { token } = require('./config.json');
+let token = process.env.DISCORD_TOKEN;
+if (!token) {
+    try {
+        const config = require('./config.json');
+        token = config.token;
+    } catch {
+        // config.json missing or doesn't contain token
+    }
+}
 
+if (!token) {
+    console.error('Error: DISCORD_TOKEN is not set in environment or config.json.');
+    process.exit(1);
+}
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ],
 });
 
 client.once(Events.ClientReady, (readyClient) => {
     console.log(`Ready! Logged in as ${readyClient.user.tag}`);
 });
+
 // Log in to Discord with your client's token
 client.login(token);
 
@@ -57,11 +72,5 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } else {
             await interaction.reply({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
         }
-    }
-});
-client.on('message', async message => {
-    // Join the same voice channel of the author of the message
-    if (message.member.voice.channel) {
-        const connection = await message.member.voice.channel.join();
     }
 });

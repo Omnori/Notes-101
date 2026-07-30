@@ -1,5 +1,5 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { joinVoiceChannel } = require('@discordjs/voice');
+const { joinVoiceChannel, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -16,12 +16,20 @@ module.exports = {
             return;
         }
 
-        joinVoiceChannel({
+        await interaction.deferReply();
+
+        const connection = joinVoiceChannel({
             channelId: voiceChannel.id,
             guildId: voiceChannel.guild.id,
             adapterCreator: voiceChannel.guild.voiceAdapterCreator,
         });
 
-        await interaction.reply(`Joined **${voiceChannel.name}**!`);
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+            await interaction.editReply(`Joined **${voiceChannel.name}**!`);
+        } catch {
+            connection.destroy();
+            await interaction.editReply(`Failed to join **${voiceChannel.name}**: connection timed out or failed.`);
+        }
     },
 };
