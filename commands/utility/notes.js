@@ -3,8 +3,8 @@ const { SlashCommandBuilder, MessageFlags, AttachmentBuilder, ChannelType, Permi
 const { joinVoiceChannel, EndBehaviorType, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 
 const { createSession, getSession, endSession } = require('../../lib/notesSessions');
-const { transcribePcm16kMono: transcribeWithGroq } = require('../../lib/groqService');
-const { getNotesChannelId, setNotesChannelId } = require('../../lib/notesChannel');
+const { transcribePcm16kMono: transcribeWithGroq, summarizeTranscriptWithGroq } = require('../../lib/groqService');
+const { getGuildConfig, setGuildKeys, clearGuildKeys, getNotesChannelId, setNotesChannelId } = require('../../lib/guildConfig');
 const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
 const { ResilientOpusDecoder } = require('../../lib/opusDecoder');
@@ -88,9 +88,14 @@ function captureUserUtterance(receiver, userId, session, guild) {
 
         let text;
         try {
-            text = await transcribeWithGroq(pcm);
+            text = await transcribeWithGroq(pcm, session.groqApiKey);
         } catch (error) {
             console.error(`[notes:${guild.id}] Groq STT transcription failed:`, error);
+            if (!session.sttErrors) session.sttErrors = [];
+            const msg = error?.message || String(error);
+            if (!session.sttErrors.includes(msg)) {
+                session.sttErrors.push(msg);
+            }
             return;
         }
         if (!text) return;
@@ -133,9 +138,12 @@ async function startNotes(interaction) {
         return;
     }
 
-    if (!process.env.GROQ_API_KEY) {
+    const guildConfig = getGuildConfig(guildId);
+    const groqKey = guildConfig.groqApiKey || process.env.GROQ_API_KEY;
+
+    if (!groqKey) {
         await interaction.reply({
-            content: 'Can\'t start notes: `GROQ_API_KEY` is not set in `.env`. Please add your Groq API key to `.env`.',
+            content: '❌ **No Groq API Key set for this server.**\nA server admin must configure an API key first using `/notes setkey groq_key:<your_groq_api_key>`.',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -174,7 +182,7 @@ async function startNotes(interaction) {
         console.error(`[notes:${guildId}] voice connection never became Ready:`, error);
         connection.destroy();
         await interaction.editReply(
-            'Joined the voice channel signaling-wise, but the audio connection never became ready.',
+            `❌ **Failed to connect to voice channel:** ${error.message || 'Connection timeout'}`,
         );
         return;
     }
@@ -185,6 +193,10 @@ async function startNotes(interaction) {
         voiceChannelName: voiceChannel.name,
         startedAt: new Date(),
         participants: new Map(),
+        groqApiKey: groqKey,
+        geminiApiKey: guildConfig.geminiApiKey || process.env.GEMINI_API_KEY,
+        summaryProvider: guildConfig.summaryProvider || process.env.SUMMARY_PROVIDER || 'groq',
+        sttErrors: [],
     });
 
     const receiver = connection.receiver;
@@ -194,7 +206,7 @@ async function startNotes(interaction) {
 
     const modelName = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
     await interaction.editReply(
-        `Joined **${voiceChannel.name}** and started taking notes with **Groq Cloud (${modelName})**. Run \`/notes stop\` when done.`,
+        `Joined **${voiceChannel.name}** and started taking notes using server API key (${modelName}). Run \`/notes stop\` when done.`,
     );
 }
 
@@ -224,7 +236,11 @@ async function stopNotes(interaction) {
     }
 
     if (session.transcript.length === 0) {
-        await interaction.editReply('Stopped. No speech was captured, so there are no notes to summarize.');
+        let msg = 'Stopped. No speech was captured, so there are no notes to summarize.';
+        if (session.sttErrors && session.sttErrors.length > 0) {
+            msg += `\n\n❌ **Speech-to-Text Errors Encountered:**\n${session.sttErrors.map((e) => `- ${e}`).join('\n')}`;
+        }
+        await interaction.editReply(msg);
         return;
     }
 
@@ -234,13 +250,50 @@ async function stopNotes(interaction) {
         .join('\n');
 
     let summary;
-    try {
-        summary = await summarizeTranscript(transcriptText);
-    } catch (error) {
-        console.error('Gemini summarization failed:', error);
+    let lastError = null;
+    const groqKey = session.groqApiKey;
+    const geminiKey = session.geminiApiKey;
+    const provider = session.summaryProvider || 'groq';
+
+    if (provider === 'gemini' && geminiKey) {
+        try {
+            summary = await summarizeTranscript(transcriptText, geminiKey);
+        } catch (error) {
+            lastError = error;
+            console.warn('[notes] Gemini summarization failed, trying Groq fallback:', error);
+            if (groqKey) {
+                try {
+                    summary = await summarizeTranscriptWithGroq(transcriptText, groqKey);
+                } catch (groqError) {
+                    lastError = groqError;
+                    console.error('All summarization attempts failed:', groqError);
+                }
+            }
+        }
+    } else if (groqKey) {
+        try {
+            summary = await summarizeTranscriptWithGroq(transcriptText, groqKey);
+        } catch (error) {
+            lastError = error;
+            console.warn('[notes] Groq summarization failed, trying Gemini fallback:', error);
+            if (geminiKey) {
+                try {
+                    summary = await summarizeTranscript(transcriptText, geminiKey);
+                } catch (geminiError) {
+                    lastError = geminiError;
+                    console.error('All summarization attempts failed:', geminiError);
+                }
+            }
+        }
+    } else {
+        lastError = new Error('No API key configured for summarization.');
+    }
+
+    if (!summary) {
+        const failureReason = lastError?.message || 'Unknown error occurred during API summarization.';
         const transcriptFile = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: 'transcript.txt' });
         await deliverOutput(interaction, guildId, {
-            content: 'Stopped taking notes. Summarization failed, but here is the raw transcript:',
+            content: `⚠️ **Summarization Failed:** ${failureReason}\nHere is the raw transcript:`,
             files: [transcriptFile],
         });
         return;
@@ -288,10 +341,83 @@ async function handleChannel(interaction) {
     await interaction.reply(`Notes will now be posted to ${channelOption}.`);
 }
 
+function checkAdminPermission(interaction) {
+    if (interaction.guild.ownerId === interaction.user.id) return true;
+    return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) || interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+}
+
+async function handleSetKey(interaction) {
+    const guildId = interaction.guildId;
+    if (!checkAdminPermission(interaction)) {
+        await interaction.reply({
+            content: 'You need the Manage Server permission or be the Server Owner to configure API keys.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const groqKey = interaction.options.getString('groq_key');
+    const geminiKey = interaction.options.getString('gemini_key');
+    const provider = interaction.options.getString('provider');
+
+    if (!groqKey && !geminiKey && !provider) {
+        return handleKeyInfo(interaction);
+    }
+
+    const updatePayload = {};
+    if (groqKey) updatePayload.groqApiKey = groqKey;
+    if (geminiKey) updatePayload.geminiApiKey = geminiKey;
+    if (provider) updatePayload.summaryProvider = provider;
+
+    setGuildKeys(guildId, updatePayload);
+
+    const config = getGuildConfig(guildId);
+    const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
+
+    await interaction.reply({
+        content: `✅ **API keys updated for ${interaction.guild.name}!**\n` +
+            `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
+            `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
+            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**`,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
+async function handleClearKey(interaction) {
+    const guildId = interaction.guildId;
+    if (!checkAdminPermission(interaction)) {
+        await interaction.reply({
+            content: 'You need the Manage Server permission or be the Server Owner to configure API keys.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    clearGuildKeys(guildId);
+    await interaction.reply({
+        content: `🗑️ API keys removed for **${interaction.guild.name}**.`,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
+async function handleKeyInfo(interaction) {
+    const guildId = interaction.guildId;
+    const config = getGuildConfig(guildId);
+    const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
+
+    await interaction.reply({
+        content: `🔑 **API Key Configuration for ${interaction.guild.name}:**\n` +
+            `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
+            `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
+            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**`,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('notes')
-        .setDescription('Voice-channel note taking (Powered by Groq Whisper & Gemini)')
+        .setDescription('Voice-channel note taking (Powered by user Groq & Gemini API keys)')
         .addSubcommand((sub) => sub.setName('start').setDescription('Join your voice channel and start taking notes'))
         .addSubcommand((sub) => sub.setName('stop').setDescription('Stop taking notes and post a summary'))
         .addSubcommand((sub) =>
@@ -305,12 +431,36 @@ module.exports = {
                         .addChannelTypes(ChannelType.GuildText)
                         .setRequired(false),
                 ),
-        ),
+        )
+        .addSubcommand((sub) =>
+            sub
+                .setName('setkey')
+                .setDescription('Set Groq / Gemini API key for this server (Admins only)')
+                .addStringOption((opt) =>
+                    opt.setName('groq_key').setDescription('Groq API Key (used for voice STT and Groq summaries)').setRequired(false),
+                )
+                .addStringOption((opt) =>
+                    opt.setName('gemini_key').setDescription('Gemini API Key (optional for Gemini summaries)').setRequired(false),
+                )
+                .addStringOption((opt) =>
+                    opt
+                        .setName('provider')
+                        .setDescription('Preferred summary AI provider')
+                        .setRequired(false)
+                        .addChoices({ name: 'Groq (Llama 3.3 70B)', value: 'groq' }, { name: 'Gemini', value: 'gemini' }),
+                ),
+        )
+        .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys configured for this server'))
+        .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API key status for this server')),
 
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
         if (sub === 'start') return startNotes(interaction);
         if (sub === 'stop') return stopNotes(interaction);
-        return handleChannel(interaction);
+        if (sub === 'channel') return handleChannel(interaction);
+        if (sub === 'setkey') return handleSetKey(interaction);
+        if (sub === 'clearkey') return handleClearKey(interaction);
+        if (sub === 'keyinfo') return handleKeyInfo(interaction);
     },
 };
+

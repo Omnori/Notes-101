@@ -66,11 +66,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
         await command.execute(interaction);
     } catch (error) {
-        console.error(error);
+        console.error(`[InteractionError:${interaction.commandName}]`, error);
+        const errorDetail = error?.message || String(error);
+        const userMessage = `❌ **Error executing /${interaction.commandName}:** ${errorDetail}`;
+
         if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
+            await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
         } else {
-            await interaction.reply({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
         }
     }
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Promise Rejection:', reason);
 });
