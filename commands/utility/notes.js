@@ -22,6 +22,10 @@ const {
     recordSession,
     getGuildStats,
     getRecentSessions,
+    logApiRequest,
+    getGuildRequestStats,
+    checkRequestQuota,
+    setGuildQuota,
 } = require('../../lib/guildConfig');
 const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
@@ -104,11 +108,35 @@ function captureUserUtterance(receiver, userId, session, guild) {
         const pcm = Buffer.concat(chunks);
         if (pcm.length < MIN_UTTERANCE_BYTES) return;
 
+        const quota = checkRequestQuota(guild.id);
+        if (!quota.allowed) {
+            console.warn(`[notes:${guild.id}] Daily API request limit reached (${quota.used}/${quota.limit})`);
+            if (!session.sttErrors) session.sttErrors = [];
+            const msg = `Daily API request limit reached (${quota.used}/${quota.limit}). Upgrade or adjust via /notes setquota.`;
+            if (!session.sttErrors.includes(msg)) session.sttErrors.push(msg);
+            return;
+        }
+
+        const model = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
         let text;
         try {
             text = await transcribeWithGroq(pcm, session.groqApiKey);
+            logApiRequest({
+                guildId: guild.id,
+                service: 'groq_stt',
+                model,
+                status: 'success',
+            });
         } catch (error) {
             console.error(`[notes:${guild.id}] Groq STT transcription failed:`, error);
+            const isRateLimit = String(error?.message || '').includes('429');
+            logApiRequest({
+                guildId: guild.id,
+                service: 'groq_stt',
+                model,
+                status: isRateLimit ? 'rate_limited' : 'error',
+                errorMessage: error?.message || String(error),
+            });
             if (!session.sttErrors) session.sttErrors = [];
             const msg = error?.message || String(error);
             if (!session.sttErrors.includes(msg)) {
@@ -254,37 +282,109 @@ function cleanRetryCache() {
     }
 }
 
-async function summarizeTranscriptContent(transcriptText, { groqKey, geminiKey, provider, groqModel, geminiModel }) {
+async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, geminiKey, provider, groqModel, geminiModel }) {
     let summary;
     let lastError = null;
 
     if (provider === 'gemini' && geminiKey) {
         try {
             summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+            if (guildId) {
+                logApiRequest({
+                    guildId,
+                    service: 'gemini_summary',
+                    model: geminiModel,
+                    status: 'success',
+                });
+            }
         } catch (error) {
             lastError = error;
             console.warn('[notes] Gemini summarization failed, trying Groq fallback:', error);
+            if (guildId) {
+                const isRateLimit = String(error?.message || '').includes('429');
+                logApiRequest({
+                    guildId,
+                    service: 'gemini_summary',
+                    model: geminiModel,
+                    status: isRateLimit ? 'rate_limited' : 'error',
+                    errorMessage: error?.message || String(error),
+                });
+            }
             if (groqKey) {
                 try {
                     summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+                    if (guildId) {
+                        logApiRequest({
+                            guildId,
+                            service: 'groq_summary',
+                            model: groqModel,
+                            status: 'success',
+                        });
+                    }
                 } catch (groqError) {
                     lastError = groqError;
                     console.error('All summarization attempts failed:', groqError);
+                    if (guildId) {
+                        const isRateLimit = String(groqError?.message || '').includes('429');
+                        logApiRequest({
+                            guildId,
+                            service: 'groq_summary',
+                            model: groqModel,
+                            status: isRateLimit ? 'rate_limited' : 'error',
+                            errorMessage: groqError?.message || String(groqError),
+                        });
+                    }
                 }
             }
         }
     } else if (groqKey) {
         try {
             summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+            if (guildId) {
+                logApiRequest({
+                    guildId,
+                    service: 'groq_summary',
+                    model: groqModel,
+                    status: 'success',
+                });
+            }
         } catch (error) {
             lastError = error;
             console.warn('[notes] Groq summarization failed, trying Gemini fallback:', error);
+            if (guildId) {
+                const isRateLimit = String(error?.message || '').includes('429');
+                logApiRequest({
+                    guildId,
+                    service: 'groq_summary',
+                    model: groqModel,
+                    status: isRateLimit ? 'rate_limited' : 'error',
+                    errorMessage: error?.message || String(error),
+                });
+            }
             if (geminiKey) {
                 try {
                     summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+                    if (guildId) {
+                        logApiRequest({
+                            guildId,
+                            service: 'gemini_summary',
+                            model: geminiModel,
+                            status: 'success',
+                        });
+                    }
                 } catch (geminiError) {
                     lastError = geminiError;
                     console.error('All summarization attempts failed:', geminiError);
+                    if (guildId) {
+                        const isRateLimit = String(geminiError?.message || '').includes('429');
+                        logApiRequest({
+                            guildId,
+                            service: 'gemini_summary',
+                            model: geminiModel,
+                            status: isRateLimit ? 'rate_limited' : 'error',
+                            errorMessage: geminiError?.message || String(geminiError),
+                        });
+                    }
                 }
             }
         }
@@ -356,6 +456,7 @@ async function stopNotes(interaction) {
     const geminiModel = session.geminiModel;
 
     const { summary, lastError } = await summarizeTranscriptContent(transcriptText, {
+        guildId,
         groqKey,
         geminiKey,
         provider,
@@ -610,6 +711,7 @@ async function handleButton(interaction) {
     const geminiModel = guildConfig.geminiModel || sessionInfo.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
     const { summary, lastError } = await summarizeTranscriptContent(transcriptText, {
+        guildId,
         groqKey,
         geminiKey,
         provider,
@@ -705,6 +807,57 @@ async function handleStats(interaction) {
     });
 }
 
+async function handleRequests(interaction) {
+    const guildId = interaction.guildId;
+    const stats = getGuildRequestStats(guildId);
+    const { daily, lifetime, limit, remaining } = stats;
+
+    const limitStr = limit > 0 ? `${limit} requests/day` : 'Unlimited (no cap)';
+    const remainingStr = limit > 0 ? `${remaining} remaining today` : 'Unlimited';
+
+    await interaction.reply({
+        content: `📡 **API Request & Quota Stats for ${interaction.guild.name}:**\n` +
+            `- **24h Total Requests:** ${daily.total_requests_24h || 0}\n` +
+            `  • Speech-to-Text (STT): ${daily.stt_requests_24h || 0}\n` +
+            `  • Summarization: ${daily.summary_requests_24h || 0}\n` +
+            `- **Rate Limit (429) Hits (24h):** ${daily.rate_limit_hits_24h || 0}\n` +
+            `- **Lifetime API Requests:** ${lifetime.total_lifetime_requests || 0}\n` +
+            `- **Daily Quota Limit:** ${limitStr}\n` +
+            `- **Remaining Today:** ${remainingStr}\n\n` +
+            `_Admins can adjust the daily cap using \`/notes setquota\`._`,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
+async function handleSetQuota(interaction) {
+    const guildId = interaction.guildId;
+    if (!checkAdminPermission(interaction)) {
+        await interaction.reply({
+            content: 'You need the Manage Server permission or be the Server Owner to configure request quotas.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const limit = interaction.options.getInteger('limit');
+    if (limit === null || limit === undefined || limit < 0) {
+        await interaction.reply({
+            content: 'Please specify a valid non-negative integer for the quota limit (0 for unlimited).',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    setGuildQuota(guildId, limit);
+
+    await interaction.reply({
+        content: limit > 0
+            ? `✅ Daily API request quota for **${interaction.guild.name}** set to **${limit} requests/day**.`
+            : `✅ Daily API request quota for **${interaction.guild.name}** is now **unlimited** (cap removed).`,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('notes')
@@ -789,7 +942,20 @@ module.exports = {
         )
         .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys and model configurations for this server'))
         .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API keys and model configuration for this server'))
-        .addSubcommand((sub) => sub.setName('stats').setDescription('View voice notes stats and meeting history for this server')),
+        .addSubcommand((sub) => sub.setName('stats').setDescription('View voice notes stats and meeting history for this server'))
+        .addSubcommand((sub) => sub.setName('requests').setDescription('View API request usage and quota stats for this server'))
+        .addSubcommand((sub) =>
+            sub
+                .setName('setquota')
+                .setDescription('Set daily API request quota limit for this server (0 = unlimited, Admins only)')
+                .addIntegerOption((opt) =>
+                    opt
+                        .setName('limit')
+                        .setDescription('Maximum API requests allowed per 24 hours (0 for unlimited)')
+                        .setRequired(true)
+                        .setMinValue(0),
+                ),
+        ),
 
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
@@ -801,6 +967,8 @@ module.exports = {
         if (sub === 'clearkey') return handleClearKey(interaction);
         if (sub === 'keyinfo') return handleKeyInfo(interaction);
         if (sub === 'stats') return handleStats(interaction);
+        if (sub === 'requests') return handleRequests(interaction);
+        if (sub === 'setquota') return handleSetQuota(interaction);
     },
     handleButton,
 };
