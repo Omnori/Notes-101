@@ -67,7 +67,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } catch (error) {
             console.error(`[InteractionError:${interaction.commandName}]`, error);
             const errorDetail = error?.message || String(error);
-            const userMessage = `❌ **Error executing /${interaction.commandName}:** ${errorDetail}`;
+            const userMessage = `**Error executing /${interaction.commandName}:** ${errorDetail}`;
 
             if (interaction.replied || interaction.deferred) {
                 await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -87,7 +87,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 } catch (error) {
                     console.error('[ButtonError:retry_notes]', error);
                     const errorDetail = error?.message || String(error);
-                    const userMessage = `❌ **Retry error:** ${errorDetail}`;
+                    const userMessage = `**Retry error:** ${errorDetail}`;
                     if (interaction.replied || interaction.deferred) {
                         await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
                     } else {

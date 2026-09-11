@@ -31,7 +31,7 @@ const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
 const { ResilientOpusDecoder } = require('../../lib/opusDecoder');
 
-const MIN_UTTERANCE_BYTES = 3200; // ~0.1s of 16kHz mono 16-bit audio, filters out noise blips
+const MIN_UTTERANCE_BYTES = 16000; // ~0.5s of 16kHz mono 16-bit audio, filters out noise blips
 
 function formatTimestamp(date) {
     return date.toTimeString().slice(0, 8);
@@ -96,7 +96,7 @@ function captureUserUtterance(receiver, userId, session, guild) {
     const timestamp = new Date();
 
     const opusStream = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
     });
     const decoder = new ResilientOpusDecoder({ rate: 48000, channels: 2, frameSize: 960 });
     const resampler = new Pcm48kStereoTo16kMono();
@@ -120,7 +120,7 @@ function captureUserUtterance(receiver, userId, session, guild) {
         const model = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
         let text;
         try {
-            text = await transcribeWithGroq(pcm, session.groqApiKey);
+            text = await transcribeWithGroq(pcm, session.groqApiKey, guild.id);
             logApiRequest({
                 guildId: guild.id,
                 service: 'groq_stt',
@@ -189,7 +189,7 @@ async function startNotes(interaction) {
 
     if (!groqKey) {
         await interaction.reply({
-            content: '❌ **No Groq API Key set for this server.**\nA server admin must configure an API key first using `/notes setkey groq_key:<your_groq_api_key>`.',
+            content: '**No Groq API Key set for this server.**\nA server admin must configure an API key first using `/notes setkey groq_key:<your_groq_api_key>`.',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -228,7 +228,7 @@ async function startNotes(interaction) {
         console.error(`[notes:${guildId}] voice connection never became Ready:`, error);
         connection.destroy();
         await interaction.editReply(
-            `❌ **Failed to connect to voice channel:** ${error.message || 'Connection timeout'}`,
+            `**Failed to connect to voice channel:** ${error.message || 'Connection timeout'}`,
         );
         return;
     }
@@ -284,17 +284,21 @@ function cleanRetryCache() {
 
 async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, geminiKey, provider, groqModel, geminiModel }) {
     let summary;
+    let totalTokens = 0;
     let lastError = null;
 
     if (provider === 'gemini' && geminiKey) {
         try {
-            summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+            const res = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+            summary = res.summary || res;
+            totalTokens = res.totalTokens || 0;
             if (guildId) {
                 logApiRequest({
                     guildId,
                     service: 'gemini_summary',
                     model: geminiModel,
                     status: 'success',
+                    tokensUsed: totalTokens,
                 });
             }
         } catch (error) {
@@ -312,13 +316,16 @@ async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, ge
             }
             if (groqKey) {
                 try {
-                    summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+                    const res = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel, guildId);
+                    summary = res.summary || res;
+                    totalTokens = res.totalTokens || 0;
                     if (guildId) {
                         logApiRequest({
                             guildId,
                             service: 'groq_summary',
                             model: groqModel,
                             status: 'success',
+                            tokensUsed: totalTokens,
                         });
                     }
                 } catch (groqError) {
@@ -339,13 +346,16 @@ async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, ge
         }
     } else if (groqKey) {
         try {
-            summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+            const res = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel, guildId);
+            summary = res.summary || res;
+            totalTokens = res.totalTokens || 0;
             if (guildId) {
                 logApiRequest({
                     guildId,
                     service: 'groq_summary',
                     model: groqModel,
                     status: 'success',
+                    tokensUsed: totalTokens,
                 });
             }
         } catch (error) {
@@ -363,13 +373,16 @@ async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, ge
             }
             if (geminiKey) {
                 try {
-                    summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+                    const res = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+                    summary = res.summary || res;
+                    totalTokens = res.totalTokens || 0;
                     if (guildId) {
                         logApiRequest({
                             guildId,
                             service: 'gemini_summary',
                             model: geminiModel,
                             status: 'success',
+                            tokensUsed: totalTokens,
                         });
                     }
                 } catch (geminiError) {
@@ -392,7 +405,7 @@ async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, ge
         lastError = new Error('No API key configured for summarization.');
     }
 
-    return { summary, lastError };
+    return { summary, totalTokens, lastError };
 }
 
 async function stopNotes(interaction) {
@@ -438,7 +451,7 @@ async function stopNotes(interaction) {
         });
         let msg = 'Stopped. No speech was captured, so there are no notes to summarize.';
         if (session.sttErrors && session.sttErrors.length > 0) {
-            msg += `\n\n❌ **Speech-to-Text Errors Encountered:**\n${session.sttErrors.map((e) => `- ${e}`).join('\n')}`;
+            msg += `\n\n**Speech-to-Text Errors Encountered:**\n${session.sttErrors.map((e) => `- ${e}`).join('\n')}`;
         }
         await interaction.editReply(msg);
         return;
@@ -504,13 +517,12 @@ async function stopNotes(interaction) {
             new ButtonBuilder()
                 .setCustomId(`retry_notes:${retryId}`)
                 .setLabel('Retry Summarization')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('🔄'),
+                .setStyle(ButtonStyle.Primary),
         );
 
         const transcriptFile = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: 'transcript.txt' });
         await deliverOutput(interaction, guildId, {
-            content: `⚠️ **Summarization Failed:** ${failureReason}\nHere is the raw transcript:`,
+            content: `**Summarization Failed:** ${failureReason}\nHere is the raw transcript:`,
             files: [transcriptFile],
             components: [retryRow],
         });
@@ -612,7 +624,7 @@ async function handleSetKey(interaction) {
     const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
 
     await interaction.reply({
-        content: `✅ **Configuration updated for ${interaction.guild.name}!**\n` +
+        content: `**Configuration updated for ${interaction.guild.name}!**\n` +
             `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
             `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
             `- **Summary Provider:** **${config.summaryProvider || 'groq'}**\n` +
@@ -647,7 +659,7 @@ async function handleSetModel(interaction) {
 
     const config = getGuildConfig(guildId);
     await interaction.reply({
-        content: `✅ **Models updated for ${interaction.guild.name}!**\n` +
+        content: `**Models updated for ${interaction.guild.name}!**\n` +
             `- **Groq Summary Model:** \`${config.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b'}\`\n` +
             `- **Gemini Summary Model:** \`${config.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash'}\``,
         flags: MessageFlags.Ephemeral,
@@ -666,7 +678,7 @@ async function handleClearKey(interaction) {
 
     clearGuildKeys(guildId);
     await interaction.reply({
-        content: `🗑️ API keys and model configurations removed for **${interaction.guild.name}**.`,
+        content: `API keys and model configurations removed for **${interaction.guild.name}**.`,
         flags: MessageFlags.Ephemeral,
     });
 }
@@ -677,7 +689,7 @@ async function handleKeyInfo(interaction) {
     const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
 
     await interaction.reply({
-        content: `🔑 **Configuration for ${interaction.guild.name}:**\n` +
+        content: `**Configuration for ${interaction.guild.name}:**\n` +
             `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
             `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
             `- **Summary Provider:** **${config.summaryProvider || 'groq'}**\n` +
@@ -693,7 +705,7 @@ async function handleButton(interaction) {
     const entry = retryCache.get(retryId);
     if (!entry) {
         await interaction.reply({
-            content: '⚠️ This retry session has expired or the bot was restarted. Please refer to the raw transcript attached above.',
+            content: 'This retry session has expired or the bot was restarted. Please refer to the raw transcript attached above.',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -725,11 +737,10 @@ async function handleButton(interaction) {
             new ButtonBuilder()
                 .setCustomId(`retry_notes:${retryId}`)
                 .setLabel('Retry Summarization')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('🔄'),
+                .setStyle(ButtonStyle.Primary),
         );
         await interaction.editReply({
-            content: `⚠️ **Retry Failed:** ${failureReason}\nYou can update your configuration via \`/notes setmodel\` and click retry again:`,
+            content: `**Retry Failed:** ${failureReason}\nYou can update your configuration via \`/notes setmodel\` and click retry again:`,
             components: [retryRow],
         });
         return;
@@ -741,8 +752,7 @@ async function handleButton(interaction) {
             .setCustomId(`retried_${retryId}`)
             .setLabel('Retried Successfully')
             .setStyle(ButtonStyle.Success)
-            .setDisabled(true)
-            .setEmoji('✅'),
+            .setDisabled(true),
     );
     await interaction.message?.edit({ components: [disabledRow] }).catch(() => {});
 
@@ -770,7 +780,7 @@ async function handleButton(interaction) {
     const notesMarkdown = buildNotesMarkdown(effectiveSession, summary);
     const notesFile = new AttachmentBuilder(Buffer.from(notesMarkdown, 'utf-8'), { name: buildFilename(effectiveSession) });
     await deliverOutput(interaction, guildId, {
-        content: '✅ **Notes successfully summarized on retry:**',
+        content: '**Notes successfully summarized on retry:**',
         files: [notesFile],
     });
 }
@@ -789,15 +799,15 @@ async function handleStats(interaction) {
         recentText = recent
             .map((r) => {
                 const date = r.started_at ? r.started_at.slice(0, 10) : 'unknown';
-                const statusEmoji = r.status === 'completed' ? '✅' : r.status === 'failed' ? '❌' : '⚠️';
+                const statusLabel = r.status === 'completed' ? '[Completed]' : r.status === 'failed' ? '[Failed]' : '[Empty]';
                 const durMin = Math.round((r.duration_seconds || 0) / 60);
-                return `${statusEmoji} **${date}** in *${r.channel_name || 'voice'}* (${durMin}m, ${r.participant_count} speakers)`;
+                return `${statusLabel} **${date}** in *${r.channel_name || 'voice'}* (${durMin}m, ${r.participant_count} speakers)`;
             })
             .join('\n');
     }
 
     await interaction.reply({
-        content: `📊 **Voice Notes Stats for ${interaction.guild.name}:**\n` +
+        content: `**Voice Notes Stats for ${interaction.guild.name}:**\n` +
             `- **Total Meetings Recorded:** ${stats.total_meetings || 0}\n` +
             `- **Successful Summaries:** ${stats.completed_meetings || 0}\n` +
             `- **Failed / Incomplete:** ${stats.failed_meetings || 0}\n` +
@@ -810,21 +820,25 @@ async function handleStats(interaction) {
 async function handleRequests(interaction) {
     const guildId = interaction.guildId;
     const stats = getGuildRequestStats(guildId);
-    const { daily, lifetime, limit, remaining } = stats;
+    const { daily, minute, lifetime, limits, guildQuota } = stats;
 
-    const limitStr = limit > 0 ? `${limit} requests/day` : 'Unlimited (no cap)';
-    const remainingStr = limit > 0 ? `${remaining} remaining today` : 'Unlimited';
+    const quotaStr = guildQuota.limit > 0 ? `${guildQuota.limit} req/day` : 'Unlimited';
+    const quotaRemainingStr = guildQuota.limit > 0 ? `${guildQuota.remaining} remaining today` : 'Unlimited';
 
     await interaction.reply({
-        content: `📡 **API Request & Quota Stats for ${interaction.guild.name}:**\n` +
-            `- **24h Total Requests:** ${daily.total_requests_24h || 0}\n` +
-            `  • Speech-to-Text (STT): ${daily.stt_requests_24h || 0}\n` +
-            `  • Summarization: ${daily.summary_requests_24h || 0}\n` +
-            `- **Rate Limit (429) Hits (24h):** ${daily.rate_limit_hits_24h || 0}\n` +
-            `- **Lifetime API Requests:** ${lifetime.total_lifetime_requests || 0}\n` +
-            `- **Daily Quota Limit:** ${limitStr}\n` +
-            `- **Remaining Today:** ${remainingStr}\n\n` +
-            `_Admins can adjust the daily cap using \`/notes setquota\`._`,
+        content: `**API Request and Quota Stats for ${interaction.guild.name}**\n\n` +
+            `**Groq Limits & Usage:**\n` +
+            `- Requests / min: ${minute.groq_requests_1m || 0} / ${limits.requestsPerMinute} RPM\n` +
+            `- Requests / day: ${daily.groq_requests_24h || 0} / ${limits.requestsPerDay.toLocaleString()} RPD\n` +
+            `- Tokens / min: ${(minute.groq_tokens_1m || 0).toLocaleString()} / ${limits.tokensPerMinute.toLocaleString()} TPM\n` +
+            `- Tokens / day: ${(daily.groq_tokens_24h || 0).toLocaleString()} / ${limits.tokensPerDay.toLocaleString()} TPD\n\n` +
+            `**Server 24h Activity:**\n` +
+            `- Total Requests: ${daily.total_requests_24h || 0} (STT: ${daily.stt_requests_24h || 0}, Summaries: ${daily.summary_requests_24h || 0})\n` +
+            `- Total Tokens: ${(daily.total_tokens_24h || 0).toLocaleString()}\n` +
+            `- Rate Limit (429) Hits: ${daily.rate_limit_hits_24h || 0}\n` +
+            `- Server Daily Quota: ${quotaStr} (${quotaRemainingStr})\n\n` +
+            `**Lifetime Total:** ${lifetime.total_lifetime_requests || 0} requests, ${(lifetime.total_lifetime_tokens || 0).toLocaleString()} tokens\n` +
+            `_Admins can configure server-level daily request caps with \`/notes setquota\`._`,
         flags: MessageFlags.Ephemeral,
     });
 }
@@ -852,8 +866,8 @@ async function handleSetQuota(interaction) {
 
     await interaction.reply({
         content: limit > 0
-            ? `✅ Daily API request quota for **${interaction.guild.name}** set to **${limit} requests/day**.`
-            : `✅ Daily API request quota for **${interaction.guild.name}** is now **unlimited** (cap removed).`,
+            ? `Daily API request quota for **${interaction.guild.name}** set to **${limit} requests/day**.`
+            : `Daily API request quota for **${interaction.guild.name}** is now **unlimited** (cap removed).`,
         flags: MessageFlags.Ephemeral,
     });
 }
