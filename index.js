@@ -54,26 +54,47 @@ for (const folder of commandFolders) {
     }
 }
 client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
+    if (interaction.isChatInputCommand()) {
+        const command = interaction.client.commands.get(interaction.commandName);
 
-    const command = interaction.client.commands.get(interaction.commandName);
+        if (!command) {
+            console.error(`No command matching ${interaction.commandName} was found.`);
+            return;
+        }
 
-    if (!command) {
-        console.error(`No command matching ${interaction.commandName} was found.`);
+        try {
+            await command.execute(interaction);
+        } catch (error) {
+            console.error(`[InteractionError:${interaction.commandName}]`, error);
+            const errorDetail = error?.message || String(error);
+            const userMessage = `❌ **Error executing /${interaction.commandName}:** ${errorDetail}`;
+
+            if (interaction.replied || interaction.deferred) {
+                await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+            } else {
+                await interaction.reply({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+            }
+        }
         return;
     }
 
-    try {
-        await command.execute(interaction);
-    } catch (error) {
-        console.error(`[InteractionError:${interaction.commandName}]`, error);
-        const errorDetail = error?.message || String(error);
-        const userMessage = `❌ **Error executing /${interaction.commandName}:** ${errorDetail}`;
-
-        if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
-        } else {
-            await interaction.reply({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+    if (interaction.isButton()) {
+        if (interaction.customId.startsWith('retry_notes:')) {
+            const command = interaction.client.commands.get('notes');
+            if (command && typeof command.handleButton === 'function') {
+                try {
+                    await command.handleButton(interaction);
+                } catch (error) {
+                    console.error('[ButtonError:retry_notes]', error);
+                    const errorDetail = error?.message || String(error);
+                    const userMessage = `❌ **Retry error:** ${errorDetail}`;
+                    if (interaction.replied || interaction.deferred) {
+                        await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+                    } else {
+                        await interaction.reply({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+                    }
+                }
+            }
         }
     }
 });

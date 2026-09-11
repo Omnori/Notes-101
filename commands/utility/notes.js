@@ -1,5 +1,14 @@
 const { pipeline } = require('node:stream/promises');
-const { SlashCommandBuilder, MessageFlags, AttachmentBuilder, ChannelType, PermissionFlagsBits } = require('discord.js');
+const {
+    SlashCommandBuilder,
+    MessageFlags,
+    AttachmentBuilder,
+    ChannelType,
+    PermissionFlagsBits,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+} = require('discord.js');
 const { joinVoiceChannel, EndBehaviorType, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 
 const { createSession, getSession, endSession } = require('../../lib/notesSessions');
@@ -187,6 +196,17 @@ async function startNotes(interaction) {
         return;
     }
 
+    const providerOverride = interaction.options.getString('provider');
+    const modelOverride = interaction.options.getString('model');
+
+    const summaryProvider = providerOverride || guildConfig.summaryProvider || process.env.SUMMARY_PROVIDER || 'groq';
+    const groqModel = (summaryProvider === 'groq' && modelOverride)
+        ? modelOverride.trim()
+        : (guildConfig.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b');
+    const geminiModel = (summaryProvider === 'gemini' && modelOverride)
+        ? modelOverride.trim()
+        : (guildConfig.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash');
+
     const session = createSession(guildId, {
         connection,
         textChannelId: interaction.channelId,
@@ -195,7 +215,9 @@ async function startNotes(interaction) {
         participants: new Map(),
         groqApiKey: groqKey,
         geminiApiKey: guildConfig.geminiApiKey || process.env.GEMINI_API_KEY,
-        summaryProvider: guildConfig.summaryProvider || process.env.SUMMARY_PROVIDER || 'groq',
+        summaryProvider,
+        groqModel,
+        geminiModel,
         sttErrors: [],
     });
 
@@ -205,9 +227,63 @@ async function startNotes(interaction) {
     session.onSpeakingStart = onSpeakingStart;
 
     const modelName = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
+    const activeSummaryModel = summaryProvider === 'gemini' ? geminiModel : groqModel;
     await interaction.editReply(
-        `Joined **${voiceChannel.name}** and started taking notes using server API key (${modelName}). Run \`/notes stop\` when done.`,
+        `Joined **${voiceChannel.name}** and started taking notes (${modelName} STT | ${summaryProvider.toUpperCase()} \`${activeSummaryModel}\` Summary). Run \`/notes stop\` when done.`,
     );
+}
+
+const retryCache = new Map();
+const RETRY_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function cleanRetryCache() {
+    const now = Date.now();
+    for (const [id, item] of retryCache.entries()) {
+        if (now - item.createdAt > RETRY_TTL_MS) {
+            retryCache.delete(id);
+        }
+    }
+}
+
+async function summarizeTranscriptContent(transcriptText, { groqKey, geminiKey, provider, groqModel, geminiModel }) {
+    let summary;
+    let lastError = null;
+
+    if (provider === 'gemini' && geminiKey) {
+        try {
+            summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+        } catch (error) {
+            lastError = error;
+            console.warn('[notes] Gemini summarization failed, trying Groq fallback:', error);
+            if (groqKey) {
+                try {
+                    summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+                } catch (groqError) {
+                    lastError = groqError;
+                    console.error('All summarization attempts failed:', groqError);
+                }
+            }
+        }
+    } else if (groqKey) {
+        try {
+            summary = await summarizeTranscriptWithGroq(transcriptText, groqKey, groqModel);
+        } catch (error) {
+            lastError = error;
+            console.warn('[notes] Groq summarization failed, trying Gemini fallback:', error);
+            if (geminiKey) {
+                try {
+                    summary = await summarizeTranscript(transcriptText, geminiKey, geminiModel);
+                } catch (geminiError) {
+                    lastError = geminiError;
+                    console.error('All summarization attempts failed:', geminiError);
+                }
+            }
+        }
+    } else {
+        lastError = new Error('No API key configured for summarization.');
+    }
+
+    return { summary, lastError };
 }
 
 async function stopNotes(interaction) {
@@ -249,52 +325,53 @@ async function stopNotes(interaction) {
         .map((entry) => `[${formatTimestamp(entry.timestamp)}] ${entry.speaker}: ${entry.text}`)
         .join('\n');
 
-    let summary;
-    let lastError = null;
     const groqKey = session.groqApiKey;
     const geminiKey = session.geminiApiKey;
     const provider = session.summaryProvider || 'groq';
+    const groqModel = session.groqModel;
+    const geminiModel = session.geminiModel;
 
-    if (provider === 'gemini' && geminiKey) {
-        try {
-            summary = await summarizeTranscript(transcriptText, geminiKey);
-        } catch (error) {
-            lastError = error;
-            console.warn('[notes] Gemini summarization failed, trying Groq fallback:', error);
-            if (groqKey) {
-                try {
-                    summary = await summarizeTranscriptWithGroq(transcriptText, groqKey);
-                } catch (groqError) {
-                    lastError = groqError;
-                    console.error('All summarization attempts failed:', groqError);
-                }
-            }
-        }
-    } else if (groqKey) {
-        try {
-            summary = await summarizeTranscriptWithGroq(transcriptText, groqKey);
-        } catch (error) {
-            lastError = error;
-            console.warn('[notes] Groq summarization failed, trying Gemini fallback:', error);
-            if (geminiKey) {
-                try {
-                    summary = await summarizeTranscript(transcriptText, geminiKey);
-                } catch (geminiError) {
-                    lastError = geminiError;
-                    console.error('All summarization attempts failed:', geminiError);
-                }
-            }
-        }
-    } else {
-        lastError = new Error('No API key configured for summarization.');
-    }
+    const { summary, lastError } = await summarizeTranscriptContent(transcriptText, {
+        groqKey,
+        geminiKey,
+        provider,
+        groqModel,
+        geminiModel,
+    });
 
     if (!summary) {
+        cleanRetryCache();
         const failureReason = lastError?.message || 'Unknown error occurred during API summarization.';
+        const retryId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        retryCache.set(retryId, {
+            guildId,
+            sessionInfo: {
+                voiceChannelName: session.voiceChannelName,
+                startedAt: session.startedAt,
+                participants: new Map(session.participants),
+                groqApiKey: groqKey,
+                geminiApiKey: geminiKey,
+                summaryProvider: provider,
+                groqModel,
+                geminiModel,
+            },
+            transcriptText,
+            createdAt: Date.now(),
+        });
+
+        const retryRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`retry_notes:${retryId}`)
+                .setLabel('Retry Summarization')
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji('🔄'),
+        );
+
         const transcriptFile = new AttachmentBuilder(Buffer.from(transcriptText, 'utf-8'), { name: 'transcript.txt' });
         await deliverOutput(interaction, guildId, {
             content: `⚠️ **Summarization Failed:** ${failureReason}\nHere is the raw transcript:`,
             files: [transcriptFile],
+            components: [retryRow],
         });
         return;
     }
@@ -359,15 +436,19 @@ async function handleSetKey(interaction) {
     const groqKey = interaction.options.getString('groq_key');
     const geminiKey = interaction.options.getString('gemini_key');
     const provider = interaction.options.getString('provider');
+    const groqModel = interaction.options.getString('groq_model');
+    const geminiModel = interaction.options.getString('gemini_model');
 
-    if (!groqKey && !geminiKey && !provider) {
+    if (!groqKey && !geminiKey && !provider && !groqModel && !geminiModel) {
         return handleKeyInfo(interaction);
     }
 
     const updatePayload = {};
-    if (groqKey) updatePayload.groqApiKey = groqKey;
-    if (geminiKey) updatePayload.geminiApiKey = geminiKey;
+    if (groqKey) updatePayload.groqApiKey = groqKey.trim();
+    if (geminiKey) updatePayload.geminiApiKey = geminiKey.trim();
     if (provider) updatePayload.summaryProvider = provider;
+    if (groqModel) updatePayload.groqModel = groqModel.trim();
+    if (geminiModel) updatePayload.geminiModel = geminiModel.trim();
 
     setGuildKeys(guildId, updatePayload);
 
@@ -375,10 +456,44 @@ async function handleSetKey(interaction) {
     const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
 
     await interaction.reply({
-        content: `✅ **API keys updated for ${interaction.guild.name}!**\n` +
+        content: `✅ **Configuration updated for ${interaction.guild.name}!**\n` +
             `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
             `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
-            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**`,
+            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**\n` +
+            `- **Groq Summary Model:** \`${config.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b'}\`\n` +
+            `- **Gemini Summary Model:** \`${config.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash'}\``,
+        flags: MessageFlags.Ephemeral,
+    });
+}
+
+async function handleSetModel(interaction) {
+    const guildId = interaction.guildId;
+    if (!checkAdminPermission(interaction)) {
+        await interaction.reply({
+            content: 'You need the Manage Server permission or be the Server Owner to configure models.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const groqModel = interaction.options.getString('groq_model');
+    const geminiModel = interaction.options.getString('gemini_model');
+
+    if (!groqModel && !geminiModel) {
+        return handleKeyInfo(interaction);
+    }
+
+    const updatePayload = {};
+    if (groqModel) updatePayload.groqModel = groqModel.trim();
+    if (geminiModel) updatePayload.geminiModel = geminiModel.trim();
+
+    setGuildKeys(guildId, updatePayload);
+
+    const config = getGuildConfig(guildId);
+    await interaction.reply({
+        content: `✅ **Models updated for ${interaction.guild.name}!**\n` +
+            `- **Groq Summary Model:** \`${config.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b'}\`\n` +
+            `- **Gemini Summary Model:** \`${config.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash'}\``,
         flags: MessageFlags.Ephemeral,
     });
 }
@@ -395,7 +510,7 @@ async function handleClearKey(interaction) {
 
     clearGuildKeys(guildId);
     await interaction.reply({
-        content: `🗑️ API keys removed for **${interaction.guild.name}**.`,
+        content: `🗑️ API keys and model configurations removed for **${interaction.guild.name}**.`,
         flags: MessageFlags.Ephemeral,
     });
 }
@@ -406,19 +521,109 @@ async function handleKeyInfo(interaction) {
     const mask = (str) => (str ? `\`${str.slice(0, 4)}...${str.slice(-4)}\`` : '_not set_');
 
     await interaction.reply({
-        content: `🔑 **API Key Configuration for ${interaction.guild.name}:**\n` +
+        content: `🔑 **Configuration for ${interaction.guild.name}:**\n` +
             `- **Groq API Key:** ${mask(config.groqApiKey)}\n` +
             `- **Gemini API Key:** ${mask(config.geminiApiKey)}\n` +
-            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**`,
+            `- **Summary Provider:** **${config.summaryProvider || 'groq'}**\n` +
+            `- **Groq Summary Model:** \`${config.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b'}\`\n` +
+            `- **Gemini Summary Model:** \`${config.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash'}\``,
         flags: MessageFlags.Ephemeral,
+    });
+}
+
+async function handleButton(interaction) {
+    if (!interaction.customId?.startsWith('retry_notes:')) return;
+    const retryId = interaction.customId.slice('retry_notes:'.length);
+    const entry = retryCache.get(retryId);
+    if (!entry) {
+        await interaction.reply({
+            content: '⚠️ This retry session has expired or the bot was restarted. Please refer to the raw transcript attached above.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    await interaction.deferReply();
+
+    const { guildId, sessionInfo, transcriptText } = entry;
+    const guildConfig = getGuildConfig(guildId);
+
+    const groqKey = guildConfig.groqApiKey || sessionInfo.groqApiKey || process.env.GROQ_API_KEY;
+    const geminiKey = guildConfig.geminiApiKey || sessionInfo.geminiApiKey || process.env.GEMINI_API_KEY;
+    const provider = guildConfig.summaryProvider || sessionInfo.summaryProvider || process.env.SUMMARY_PROVIDER || 'groq';
+    const groqModel = guildConfig.groqModel || sessionInfo.groqModel || process.env.GROQ_SUMMARY_MODEL || 'openai/gpt-oss-120b';
+    const geminiModel = guildConfig.geminiModel || sessionInfo.geminiModel || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+    const { summary, lastError } = await summarizeTranscriptContent(transcriptText, {
+        groqKey,
+        geminiKey,
+        provider,
+        groqModel,
+        geminiModel,
+    });
+
+    if (!summary) {
+        const failureReason = lastError?.message || 'Unknown error occurred during API summarization.';
+        const retryRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`retry_notes:${retryId}`)
+                .setLabel('Retry Summarization')
+                .setStyle(ButtonStyle.Primary)
+                .setEmoji('🔄'),
+        );
+        await interaction.editReply({
+            content: `⚠️ **Retry Failed:** ${failureReason}\nYou can update your configuration via \`/notes setmodel\` and click retry again:`,
+            components: [retryRow],
+        });
+        return;
+    }
+
+    // Disable the button on the previous message if possible
+    const disabledRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`retried_${retryId}`)
+            .setLabel('Retried Successfully')
+            .setStyle(ButtonStyle.Success)
+            .setDisabled(true)
+            .setEmoji('✅'),
+    );
+    await interaction.message?.edit({ components: [disabledRow] }).catch(() => {});
+
+    // Deliver the finalized notes
+    const effectiveSession = {
+        ...sessionInfo,
+        startedAt: sessionInfo.startedAt instanceof Date ? sessionInfo.startedAt : new Date(sessionInfo.startedAt),
+    };
+    const notesMarkdown = buildNotesMarkdown(effectiveSession, summary);
+    const notesFile = new AttachmentBuilder(Buffer.from(notesMarkdown, 'utf-8'), { name: buildFilename(effectiveSession) });
+    await deliverOutput(interaction, guildId, {
+        content: '✅ **Notes successfully summarized on retry:**',
+        files: [notesFile],
     });
 }
 
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('notes')
-        .setDescription('Voice-channel note taking (Powered by user Groq & Gemini API keys)')
-        .addSubcommand((sub) => sub.setName('start').setDescription('Join your voice channel and start taking notes'))
+        .setDescription('Voice-channel note taking (Powered by Groq & Gemini)')
+        .addSubcommand((sub) =>
+            sub
+                .setName('start')
+                .setDescription('Join your voice channel and start taking notes')
+                .addStringOption((opt) =>
+                    opt
+                        .setName('provider')
+                        .setDescription('Override summary AI provider for this session')
+                        .setRequired(false)
+                        .addChoices({ name: 'Groq', value: 'groq' }, { name: 'Gemini', value: 'gemini' }),
+                )
+                .addStringOption((opt) =>
+                    opt
+                        .setName('model')
+                        .setDescription('Override summary model code name (e.g. openai/gpt-oss-120b, gemini-2.5-flash)')
+                        .setRequired(false),
+                ),
+        )
         .addSubcommand((sub) => sub.setName('stop').setDescription('Stop taking notes and post a summary'))
         .addSubcommand((sub) =>
             sub
@@ -435,7 +640,7 @@ module.exports = {
         .addSubcommand((sub) =>
             sub
                 .setName('setkey')
-                .setDescription('Set Groq / Gemini API key for this server (Admins only)')
+                .setDescription('Set Groq / Gemini API key and models for this server (Admins only)')
                 .addStringOption((opt) =>
                     opt.setName('groq_key').setDescription('Groq API Key (used for voice STT and Groq summaries)').setRequired(false),
                 )
@@ -447,11 +652,40 @@ module.exports = {
                         .setName('provider')
                         .setDescription('Preferred summary AI provider')
                         .setRequired(false)
-                        .addChoices({ name: 'Groq (Llama 3.3 70B)', value: 'groq' }, { name: 'Gemini', value: 'gemini' }),
+                        .addChoices({ name: 'Groq', value: 'groq' }, { name: 'Gemini', value: 'gemini' }),
+                )
+                .addStringOption((opt) =>
+                    opt
+                        .setName('groq_model')
+                        .setDescription('Groq summary model code name (e.g. openai/gpt-oss-120b, openai/gpt-oss-20b)')
+                        .setRequired(false),
+                )
+                .addStringOption((opt) =>
+                    opt
+                        .setName('gemini_model')
+                        .setDescription('Gemini summary model code name (e.g. gemini-2.5-flash, gemini-1.5-pro)')
+                        .setRequired(false),
                 ),
         )
-        .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys configured for this server'))
-        .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API key status for this server')),
+        .addSubcommand((sub) =>
+            sub
+                .setName('setmodel')
+                .setDescription('Set summary AI model code names for Groq or Gemini (Admins only)')
+                .addStringOption((opt) =>
+                    opt
+                        .setName('groq_model')
+                        .setDescription('Groq summary model code name (e.g. openai/gpt-oss-120b, openai/gpt-oss-20b)')
+                        .setRequired(false),
+                )
+                .addStringOption((opt) =>
+                    opt
+                        .setName('gemini_model')
+                        .setDescription('Gemini summary model code name (e.g. gemini-2.5-flash, gemini-1.5-pro)')
+                        .setRequired(false),
+                ),
+        )
+        .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys and model configurations for this server'))
+        .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API keys and model configuration for this server')),
 
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
@@ -459,8 +693,10 @@ module.exports = {
         if (sub === 'stop') return stopNotes(interaction);
         if (sub === 'channel') return handleChannel(interaction);
         if (sub === 'setkey') return handleSetKey(interaction);
+        if (sub === 'setmodel') return handleSetModel(interaction);
         if (sub === 'clearkey') return handleClearKey(interaction);
         if (sub === 'keyinfo') return handleKeyInfo(interaction);
     },
+    handleButton,
 };
 
