@@ -3,3 +3,7 @@ node_modules/
 config.json
 guild_configs.json
 .claude/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db

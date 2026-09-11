@@ -13,7 +13,16 @@ const { joinVoiceChannel, EndBehaviorType, VoiceConnectionStatus, entersState } 
 
 const { createSession, getSession, endSession } = require('../../lib/notesSessions');
 const { transcribePcm16kMono: transcribeWithGroq, summarizeTranscriptWithGroq } = require('../../lib/groqService');
-const { getGuildConfig, setGuildKeys, clearGuildKeys, getNotesChannelId, setNotesChannelId } = require('../../lib/guildConfig');
+const {
+    getGuildConfig,
+    setGuildKeys,
+    clearGuildKeys,
+    getNotesChannelId,
+    setNotesChannelId,
+    recordSession,
+    getGuildStats,
+    getRecentSessions,
+} = require('../../lib/guildConfig');
 const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
 const { ResilientOpusDecoder } = require('../../lib/opusDecoder');
@@ -312,6 +321,21 @@ async function stopNotes(interaction) {
     }
 
     if (session.transcript.length === 0) {
+        recordSession({
+            guildId,
+            channelId: session.textChannelId,
+            channelName: session.voiceChannelName,
+            startedAt: session.startedAt,
+            endedAt: new Date(),
+            durationSeconds: (Date.now() - session.startedAt.getTime()) / 1000,
+            participantCount: session.participants.size,
+            participants: [...session.participants.values()],
+            summaryProvider: session.summaryProvider,
+            summaryModel: session.summaryProvider === 'gemini' ? session.geminiModel : session.groqModel,
+            transcriptEntriesCount: 0,
+            status: 'empty',
+            errorMessage: session.sttErrors?.join('; ') || null,
+        });
         let msg = 'Stopped. No speech was captured, so there are no notes to summarize.';
         if (session.sttErrors && session.sttErrors.length > 0) {
             msg += `\n\n❌ **Speech-to-Text Errors Encountered:**\n${session.sttErrors.map((e) => `- ${e}`).join('\n')}`;
@@ -342,6 +366,22 @@ async function stopNotes(interaction) {
     if (!summary) {
         cleanRetryCache();
         const failureReason = lastError?.message || 'Unknown error occurred during API summarization.';
+        recordSession({
+            guildId,
+            channelId: session.textChannelId,
+            channelName: session.voiceChannelName,
+            startedAt: session.startedAt,
+            endedAt: new Date(),
+            durationSeconds: (Date.now() - session.startedAt.getTime()) / 1000,
+            participantCount: session.participants.size,
+            participants: [...session.participants.values()],
+            summaryProvider: provider,
+            summaryModel: provider === 'gemini' ? geminiModel : groqModel,
+            transcriptEntriesCount: session.transcript.length,
+            status: 'failed',
+            errorMessage: failureReason,
+        });
+
         const retryId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         retryCache.set(retryId, {
             guildId,
@@ -375,6 +415,21 @@ async function stopNotes(interaction) {
         });
         return;
     }
+
+    recordSession({
+        guildId,
+        channelId: session.textChannelId,
+        channelName: session.voiceChannelName,
+        startedAt: session.startedAt,
+        endedAt: new Date(),
+        durationSeconds: (Date.now() - session.startedAt.getTime()) / 1000,
+        participantCount: session.participants.size,
+        participants: [...session.participants.values()],
+        summaryProvider: provider,
+        summaryModel: provider === 'gemini' ? geminiModel : groqModel,
+        transcriptEntriesCount: session.transcript.length,
+        status: 'completed',
+    });
 
     const notesMarkdown = buildNotesMarkdown(session, summary);
     const notesFile = new AttachmentBuilder(Buffer.from(notesMarkdown, 'utf-8'), { name: buildFilename(session) });
@@ -594,11 +649,59 @@ async function handleButton(interaction) {
         ...sessionInfo,
         startedAt: sessionInfo.startedAt instanceof Date ? sessionInfo.startedAt : new Date(sessionInfo.startedAt),
     };
+
+    recordSession({
+        guildId,
+        channelId: interaction.channelId,
+        channelName: sessionInfo.voiceChannelName,
+        startedAt: effectiveSession.startedAt,
+        endedAt: new Date(),
+        durationSeconds: (Date.now() - effectiveSession.startedAt.getTime()) / 1000,
+        participantCount: sessionInfo.participants?.size || 0,
+        participants: sessionInfo.participants ? [...sessionInfo.participants.values()] : [],
+        summaryProvider: provider,
+        summaryModel: provider === 'gemini' ? geminiModel : groqModel,
+        transcriptEntriesCount: transcriptText.split('\n').filter(Boolean).length,
+        status: 'completed',
+    });
+
     const notesMarkdown = buildNotesMarkdown(effectiveSession, summary);
     const notesFile = new AttachmentBuilder(Buffer.from(notesMarkdown, 'utf-8'), { name: buildFilename(effectiveSession) });
     await deliverOutput(interaction, guildId, {
         content: '✅ **Notes successfully summarized on retry:**',
         files: [notesFile],
+    });
+}
+
+async function handleStats(interaction) {
+    const guildId = interaction.guildId;
+    const stats = getGuildStats(guildId);
+    const recent = getRecentSessions(guildId, 5);
+
+    const totalHours = Math.floor((stats.total_duration_seconds || 0) / 3600);
+    const totalMinutes = Math.floor(((stats.total_duration_seconds || 0) % 3600) / 60);
+    const timeFormatted = totalHours > 0 ? `${totalHours}h ${totalMinutes}m` : `${totalMinutes}m`;
+
+    let recentText = '_No meetings recorded yet._';
+    if (recent && recent.length > 0) {
+        recentText = recent
+            .map((r) => {
+                const date = r.started_at ? r.started_at.slice(0, 10) : 'unknown';
+                const statusEmoji = r.status === 'completed' ? '✅' : r.status === 'failed' ? '❌' : '⚠️';
+                const durMin = Math.round((r.duration_seconds || 0) / 60);
+                return `${statusEmoji} **${date}** in *${r.channel_name || 'voice'}* (${durMin}m, ${r.participant_count} speakers)`;
+            })
+            .join('\n');
+    }
+
+    await interaction.reply({
+        content: `📊 **Voice Notes Stats for ${interaction.guild.name}:**\n` +
+            `- **Total Meetings Recorded:** ${stats.total_meetings || 0}\n` +
+            `- **Successful Summaries:** ${stats.completed_meetings || 0}\n` +
+            `- **Failed / Incomplete:** ${stats.failed_meetings || 0}\n` +
+            `- **Total Meeting Time:** ${timeFormatted}\n\n` +
+            `**Recent Meetings:**\n${recentText}`,
+        flags: MessageFlags.Ephemeral,
     });
 }
 
@@ -685,7 +788,8 @@ module.exports = {
                 ),
         )
         .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys and model configurations for this server'))
-        .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API keys and model configuration for this server')),
+        .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API keys and model configuration for this server'))
+        .addSubcommand((sub) => sub.setName('stats').setDescription('View voice notes stats and meeting history for this server')),
 
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
@@ -696,6 +800,7 @@ module.exports = {
         if (sub === 'setmodel') return handleSetModel(interaction);
         if (sub === 'clearkey') return handleClearKey(interaction);
         if (sub === 'keyinfo') return handleKeyInfo(interaction);
+        if (sub === 'stats') return handleStats(interaction);
     },
     handleButton,
 };
