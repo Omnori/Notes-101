@@ -23,9 +23,6 @@ const {
     getGuildStats,
     getRecentSessions,
     logApiRequest,
-    getGuildRequestStats,
-    checkRequestQuota,
-    setGuildQuota,
 } = require('../../lib/guildConfig');
 const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
@@ -107,15 +104,6 @@ function captureUserUtterance(receiver, userId, session, guild) {
         session.activeStreams.delete(userId);
         const pcm = Buffer.concat(chunks);
         if (pcm.length < MIN_UTTERANCE_BYTES) return;
-
-        const quota = checkRequestQuota(guild.id);
-        if (!quota.allowed) {
-            console.warn(`[notes:${guild.id}] Daily API request limit reached (${quota.used}/${quota.limit})`);
-            if (!session.sttErrors) session.sttErrors = [];
-            const msg = `Daily API request limit reached (${quota.used}/${quota.limit}). Upgrade or adjust via /notes setquota.`;
-            if (!session.sttErrors.includes(msg)) session.sttErrors.push(msg);
-            return;
-        }
 
         const model = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
         let text;
@@ -817,61 +805,6 @@ async function handleStats(interaction) {
     });
 }
 
-async function handleRequests(interaction) {
-    const guildId = interaction.guildId;
-    const stats = getGuildRequestStats(guildId);
-    const { daily, minute, lifetime, limits, guildQuota } = stats;
-
-    const quotaStr = guildQuota.limit > 0 ? `${guildQuota.limit} req/day` : 'Unlimited';
-    const quotaRemainingStr = guildQuota.limit > 0 ? `${guildQuota.remaining} remaining today` : 'Unlimited';
-
-    await interaction.reply({
-        content: `**API Request and Quota Stats for ${interaction.guild.name}**\n\n` +
-            `**Groq Limits & Usage:**\n` +
-            `- Requests / min: ${minute.groq_requests_1m || 0} / ${limits.requestsPerMinute} RPM\n` +
-            `- Requests / day: ${daily.groq_requests_24h || 0} / ${limits.requestsPerDay.toLocaleString()} RPD\n` +
-            `- Tokens / min: ${(minute.groq_tokens_1m || 0).toLocaleString()} / ${limits.tokensPerMinute.toLocaleString()} TPM\n` +
-            `- Tokens / day: ${(daily.groq_tokens_24h || 0).toLocaleString()} / ${limits.tokensPerDay.toLocaleString()} TPD\n\n` +
-            `**Server 24h Activity:**\n` +
-            `- Total Requests: ${daily.total_requests_24h || 0} (STT: ${daily.stt_requests_24h || 0}, Summaries: ${daily.summary_requests_24h || 0})\n` +
-            `- Total Tokens: ${(daily.total_tokens_24h || 0).toLocaleString()}\n` +
-            `- Rate Limit (429) Hits: ${daily.rate_limit_hits_24h || 0}\n` +
-            `- Server Daily Quota: ${quotaStr} (${quotaRemainingStr})\n\n` +
-            `**Lifetime Total:** ${lifetime.total_lifetime_requests || 0} requests, ${(lifetime.total_lifetime_tokens || 0).toLocaleString()} tokens\n` +
-            `_Admins can configure server-level daily request caps with \`/notes setquota\`._`,
-        flags: MessageFlags.Ephemeral,
-    });
-}
-
-async function handleSetQuota(interaction) {
-    const guildId = interaction.guildId;
-    if (!checkAdminPermission(interaction)) {
-        await interaction.reply({
-            content: 'You need the Manage Server permission or be the Server Owner to configure request quotas.',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
-    const limit = interaction.options.getInteger('limit');
-    if (limit === null || limit === undefined || limit < 0) {
-        await interaction.reply({
-            content: 'Please specify a valid non-negative integer for the quota limit (0 for unlimited).',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
-    setGuildQuota(guildId, limit);
-
-    await interaction.reply({
-        content: limit > 0
-            ? `Daily API request quota for **${interaction.guild.name}** set to **${limit} requests/day**.`
-            : `Daily API request quota for **${interaction.guild.name}** is now **unlimited** (cap removed).`,
-        flags: MessageFlags.Ephemeral,
-    });
-}
-
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('notes')
@@ -956,20 +889,7 @@ module.exports = {
         )
         .addSubcommand((sub) => sub.setName('clearkey').setDescription('Clear API keys and model configurations for this server'))
         .addSubcommand((sub) => sub.setName('keyinfo').setDescription('View API keys and model configuration for this server'))
-        .addSubcommand((sub) => sub.setName('stats').setDescription('View voice notes stats and meeting history for this server'))
-        .addSubcommand((sub) => sub.setName('requests').setDescription('View API request usage and quota stats for this server'))
-        .addSubcommand((sub) =>
-            sub
-                .setName('setquota')
-                .setDescription('Set daily API request quota limit for this server (0 = unlimited, Admins only)')
-                .addIntegerOption((opt) =>
-                    opt
-                        .setName('limit')
-                        .setDescription('Maximum API requests allowed per 24 hours (0 for unlimited)')
-                        .setRequired(true)
-                        .setMinValue(0),
-                ),
-        ),
+        .addSubcommand((sub) => sub.setName('stats').setDescription('View voice notes stats and meeting history for this server')),
 
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
@@ -981,8 +901,6 @@ module.exports = {
         if (sub === 'clearkey') return handleClearKey(interaction);
         if (sub === 'keyinfo') return handleKeyInfo(interaction);
         if (sub === 'stats') return handleStats(interaction);
-        if (sub === 'requests') return handleRequests(interaction);
-        if (sub === 'setquota') return handleSetQuota(interaction);
     },
     handleButton,
 };
