@@ -2,7 +2,7 @@ const assert = require('node:assert');
 const { encrypt, decrypt, isEncrypted } = require('../lib/crypto');
 const { updateGuildConfig, getGuildConfig, sanitizeAuditDetails, logAudit, getRecentAuditLogs } = require('../lib/database');
 const { withRetry, normalizeNotionId, provisionWikiStructure } = require('../lib/notion');
-const { normalizeSection, sanitizeContent, withGuildLock, applyOrgInfoPatch } = require('../lib/orgInfoSync');
+const { normalizeSection, sanitizeContent, withGuildLock, applyOrgInfoPatch, fetchCentralWikiMap, fetchOrgInfoContext } = require('../lib/orgInfoSync');
 const { handleFollowUpInteraction, getOrCreateMemberPage } = require('../lib/memberAssistant');
 const { sanitizeErrorMessage } = require('../lib/safeError');
 const { handleButton } = require('../commands/utility/notes');
@@ -515,6 +515,203 @@ async function runTests() {
 
         await Promise.all([task1, task2, task3]);
         assert.strictEqual(order.indexOf('A1') < order.indexOf('A2'), true, 'Tasks for the same guild must execute sequentially');
+    });
+
+    test('normalizeSection maps Omnori operational categories and domains', () => {
+        assert.strictEqual(normalizeSection('sprint goals and notices'), 'Sprint Focus & Priorities');
+        assert.strictEqual(normalizeSection('Nori V Cam chrome extension and products'), 'Active Products & Tech Lab');
+        assert.strictEqual(normalizeSection('Diyo client account & CRM'), 'Clients & Partnerships');
+        assert.strictEqual(normalizeSection('agency services and outbound pitching'), 'Agency Services & Operations');
+        assert.strictEqual(normalizeSection('capital raising, equity dilution and term sheet'), 'Capital, Finance & Corporate');
+        assert.strictEqual(normalizeSection('Sprint Focus & Priorities'), 'Sprint Focus & Priorities');
+        assert.strictEqual(normalizeSection('Active Products & Tech Lab'), 'Active Products & Tech Lab');
+        assert.strictEqual(normalizeSection('Clients & Partnerships'), 'Clients & Partnerships');
+        assert.strictEqual(normalizeSection('Agency Services & Operations'), 'Agency Services & Operations');
+        assert.strictEqual(normalizeSection('Capital, Finance & Corporate'), 'Capital, Finance & Corporate');
+    });
+
+    await asyncTest('fetchCentralWikiMap recurses into columns and formats layout into markdown', async () => {
+        const mockClient = {
+            blocks: {
+                children: {
+                    list: async ({ block_id }) => {
+                        if (block_id === 'root_wiki') {
+                            return {
+                                results: [
+                                    {
+                                        id: 'head-sprint',
+                                        type: 'heading_1',
+                                        heading_1: { rich_text: [{ plain_text: 'Omnori Sprint Focus & Notice Board' }] },
+                                    },
+                                    {
+                                        id: 'item-cam',
+                                        type: 'numbered_list_item',
+                                        numbered_list_item: { rich_text: [{ plain_text: 'Nori V Cam Chrome Web Store release' }] },
+                                    },
+                                    {
+                                        id: 'callout-metric',
+                                        type: 'callout',
+                                        callout: { rich_text: [{ plain_text: 'North Star Metric: 1k -> 5k users' }] },
+                                    },
+                                    {
+                                        id: 'collist-1',
+                                        type: 'column_list',
+                                        has_children: true,
+                                    },
+                                ],
+                                has_more: false,
+                            };
+                        }
+                        if (block_id === 'collist-1') {
+                            return {
+                                results: [
+                                    { id: 'col-1', type: 'column', has_children: true },
+                                ],
+                                has_more: false,
+                            };
+                        }
+                        if (block_id === 'col-1') {
+                            return {
+                                results: [
+                                    {
+                                        id: 'head-prod',
+                                        type: 'heading_2',
+                                        heading_2: { rich_text: [{ plain_text: 'Products & Media Lab' }] },
+                                    },
+                                    {
+                                        id: 'page-cam',
+                                        type: 'child_page',
+                                        child_page: { title: 'Updating UI of Nori V Cam' },
+                                    },
+                                    {
+                                        id: 'page-diyo',
+                                        type: 'child_page',
+                                        child_page: { title: 'Diyo growth plan' },
+                                    },
+                                ],
+                                has_more: false,
+                            };
+                        }
+                        return { results: [], has_more: false };
+                    },
+                },
+            },
+        };
+
+        const map = await fetchCentralWikiMap(mockClient, 'root_wiki');
+        assert.ok(map.includes('# Omnori Sprint Focus & Notice Board'), 'Must include top-level heading');
+        assert.ok(map.includes('1. Nori V Cam Chrome Web Store release'), 'Must include numbered item');
+        assert.ok(map.includes('> [Notice] North Star Metric: 1k -> 5k users'), 'Must include callout');
+        assert.ok(map.includes('## Products & Media Lab'), 'Must include child column heading');
+        assert.ok(map.includes('📄 Page: Updating UI of Nori V Cam'), 'Must include child page from column');
+        assert.ok(map.includes('📄 Page: Diyo growth plan'), 'Must include child page from column');
+    });
+
+    await asyncTest('applyOrgInfoPatch correctly maps and adds items to Omnori canonical sections', async () => {
+        const appended = [];
+        const mockClient = {
+            blocks: {
+                update: async () => ({}),
+                children: {
+                    append: async (req) => {
+                        appended.push(req);
+                        return { results: [{ id: 'new-block-id' }] };
+                    },
+                },
+            },
+        };
+
+        const sections = {
+            'Sprint Focus & Priorities': {
+                headingId: 'head-sprint',
+                items: [],
+            },
+            'Active Products & Tech Lab': {
+                headingId: 'head-prod',
+                items: [{ id: 'prod-item-1', type: 'bulleted_list_item', text: 'Nori V Cam moon theme' }],
+            },
+            'Clients & Partnerships': {
+                headingId: 'head-clients',
+                items: [],
+            },
+            'Decisions & Policies': {
+                headingId: 'head-decisions',
+                items: [],
+            },
+        };
+
+        const updates = [
+            { action: 'add', section: 'Sprint Focus & Priorities', content: 'Complete MSME and PAN registration' },
+            { action: 'add', section: 'Active Products & Tech Lab', content: 'Dogesh Sultan video series release' },
+            { action: 'add', section: 'Clients & Partnerships', content: 'Kaapi Money review scheduled for Friday' },
+        ];
+
+        const res = await applyOrgInfoPatch(mockClient, 'org-info-page', sections, updates);
+        assert.strictEqual(res.addedCount, 3, 'All 3 items must be added');
+        assert.strictEqual(appended.length, 3, 'Must call append 3 times');
+        assert.strictEqual(appended[0].after, 'head-sprint', 'First add must anchor to heading when items empty');
+        assert.strictEqual(appended[1].after, 'prod-item-1', 'Second add must anchor to existing item in section');
+        assert.strictEqual(appended[2].after, 'head-clients', 'Third add must anchor to clients heading');
+    });
+
+    await asyncTest('fetchOrgInfoContext combines Central Wiki reference and dynamic Org Info structure', async () => {
+        const mockClient = {
+            blocks: {
+                children: {
+                    list: async ({ block_id }) => {
+                        if (block_id === 'wiki-123') {
+                            return {
+                                results: [
+                                    {
+                                        id: 'head-wiki',
+                                        type: 'heading_1',
+                                        heading_1: { rich_text: [{ plain_text: 'Omnori Central Wiki' }] },
+                                    },
+                                    {
+                                        id: 'page-finance',
+                                        type: 'child_page',
+                                        child_page: { title: 'Startup Finance & Equity' },
+                                    },
+                                ],
+                                has_more: false,
+                            };
+                        }
+                        if (block_id === 'org-123') {
+                            return {
+                                results: [
+                                    {
+                                        id: 'sec-head',
+                                        type: 'heading_2',
+                                        heading_2: { rich_text: [{ plain_text: 'Active Products & Tech Lab' }] },
+                                    },
+                                    {
+                                        id: 'sec-item',
+                                        type: 'bulleted_list_item',
+                                        bulleted_list_item: { rich_text: [{ plain_text: 'Nori V Cam beta version live' }] },
+                                    },
+                                ],
+                                has_more: false,
+                            };
+                        }
+                        return { results: [], has_more: false };
+                    },
+                },
+            },
+        };
+
+        // Test with both wikiPageId and orgInfoPageId
+        const combined = await fetchOrgInfoContext('mock-token', 'org-123', 'wiki-123', mockClient);
+        assert.ok(combined.includes('## CENTRAL WIKI REFERENCE & WORKSPACE MAP'), 'Must include wiki map header');
+        assert.ok(combined.includes('# Omnori Central Wiki'), 'Must include wiki heading');
+        assert.ok(combined.includes('📄 Page: Startup Finance & Equity'), 'Must include wiki child page');
+        assert.ok(combined.includes('## DYNAMIC ORG WORKING MEMORY & FACTS'), 'Must include dynamic org facts header');
+        assert.ok(combined.includes('## Active Products & Tech Lab'), 'Must include org section');
+        assert.ok(combined.includes('* Nori V Cam beta version live'), 'Must include org facts');
+
+        // Test with only orgInfoPageId (backward compatibility)
+        const orgOnly = await fetchOrgInfoContext('mock-token', 'org-123', null, mockClient);
+        assert.ok(!orgOnly.includes('## CENTRAL WIKI REFERENCE & WORKSPACE MAP'), 'Must not include wiki map header');
+        assert.ok(orgOnly.includes('## Active Products & Tech Lab'), 'Must include org section directly');
     });
 
     // =============================================================

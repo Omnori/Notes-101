@@ -297,10 +297,10 @@ async function summarizeTranscriptContent(transcriptText, { guildId, groqKey, ge
     if (effectiveOrgContext === null && guildId) {
         try {
             const guildConfig = getGuildConfig(guildId);
-            if (guildConfig.notionToken && guildConfig.orgInfoPageId) {
-                effectiveOrgContext = await fetchOrgInfoContext(guildConfig.notionToken, guildConfig.orgInfoPageId);
+            if (guildConfig.notionToken && (guildConfig.orgInfoPageId || guildConfig.wikiPageId)) {
+                effectiveOrgContext = await fetchOrgInfoContext(guildConfig.notionToken, guildConfig.orgInfoPageId, guildConfig.wikiPageId);
                 if (effectiveOrgContext) {
-                    console.log(`[notes:${guildId}] Injected fresh Org Info context into summarization (${effectiveOrgContext.length} chars).`);
+                    console.log(`[notes:${guildId}] Injected fresh Org Info & Central Wiki context into summarization (${effectiveOrgContext.length} chars).`);
                 }
             }
         } catch (err) {
@@ -1163,9 +1163,9 @@ async function handleAsk(interaction) {
 
     try {
         let orgInfoText = '';
-        if (config.orgInfoPageId) {
+        if (config.notionToken && (config.orgInfoPageId || config.wikiPageId)) {
             try {
-                orgInfoText = await fetchOrgInfoContext(config.notionToken, config.orgInfoPageId);
+                orgInfoText = await fetchOrgInfoContext(config.notionToken, config.orgInfoPageId, config.wikiPageId);
             } catch (err) {
                 console.warn(`[notes:ask] Warning fetching org context:`, err.message);
             }
