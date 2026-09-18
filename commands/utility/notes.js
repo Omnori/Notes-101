@@ -49,6 +49,11 @@ const { summarizeTranscript } = require('../../lib/geminiService');
 const { Pcm48kStereoTo16kMono } = require('../../lib/pcmResampler');
 const { ResilientOpusDecoder } = require('../../lib/opusDecoder');
 const { sanitizeErrorMessage } = require('../../lib/safeError');
+const {
+    truncateDiscordText,
+    sendSafeChunkedReply,
+    sendSafeMessageReply,
+} = require('../../lib/discordUtils');
 
 const MIN_UTTERANCE_BYTES = 16000; // ~0.5s of 16kHz mono 16-bit audio, filters out noise blips
 
@@ -102,8 +107,10 @@ async function deliverOutput(interaction, guildId, payload) {
         await interaction.editReply(`Posted in <#${channelId}>.`);
     } catch (error) {
         console.error(`[notes:${guildId}] failed to post to configured notes channel ${channelId}:`, error);
+        const prefix = `Couldn't post to the configured notes channel (<#${channelId}>), posting here instead:\n`;
+        const safeContent = truncateDiscordText(payload.content ?? '', 1900 - prefix.length);
         await interaction.editReply({
-            content: `Couldn't post to the configured notes channel (<#${channelId}>), posting here instead:\n${payload.content ?? ''}`,
+            content: `${prefix}${safeContent}`,
             files: payload.files,
         });
     }
@@ -478,9 +485,11 @@ async function stopNotes(interaction) {
         });
         let msg = 'Stopped. No speech was captured, so there are no notes to summarize.';
         if (session.sttErrors && session.sttErrors.length > 0) {
-            msg += `\n\n**Speech-to-Text Errors Encountered:**\n${session.sttErrors.map((e) => `- ${e}`).join('\n')}`;
+            const errorList = session.sttErrors.slice(0, 5).map((e) => `- ${truncateDiscordText(e, 120)}`).join('\n');
+            const extra = session.sttErrors.length > 5 ? `\n- _...and ${session.sttErrors.length - 5} more STT error(s)._` : '';
+            msg += `\n\n**Speech-to-Text Errors Encountered:**\n${errorList}${extra}`;
         }
-        await interaction.editReply(msg);
+        await interaction.editReply(truncateDiscordText(msg, 1950));
         return;
     }
 
@@ -506,7 +515,7 @@ async function stopNotes(interaction) {
 
     if (!summary) {
         cleanRetryCache();
-        const failureReason = lastError?.message || 'Unknown error occurred during API summarization.';
+        const failureReason = sanitizeErrorMessage(lastError) || 'Unknown error occurred during API summarization.';
         recordSession({
             guildId,
             channelId: session.textChannelId,
@@ -1167,16 +1176,26 @@ async function handleSync(interaction) {
             return;
         }
 
-        const patchDetails = syncRes.patches.map((p) => {
+        let patchDetails = '';
+        let omittedCount = 0;
+        for (const p of syncRes.patches) {
             const badge = p.action === 'update' ? '🔄 [UPDATE]' : '➕ [ADD]';
-            return `• ${badge} **${p.section}**: ${p.content}`;
-        }).join('\n');
+            const line = `• ${badge} **${p.section}**: ${p.content}\n`;
+            if ((patchDetails + line).length > 1400) {
+                omittedCount++;
+            } else {
+                patchDetails += line;
+            }
+        }
+        if (omittedCount > 0) {
+            patchDetails += `\n_...and ${omittedCount} additional patch(es)._`;
+        }
 
         await interaction.editReply({
             content: `✅ **Org Info Synchronized for ${interaction.guild.name}!**\n` +
                 `- **Facts Added:** ${syncRes.addedCount}\n` +
                 `- **Facts Updated:** ${syncRes.updatedCount}\n\n` +
-                `**Applied Block Patches:**\n${patchDetails}`,
+                `**Applied Block Patches:**\n${patchDetails.trim()}`,
         });
     } catch (err) {
         console.error(`[notes:${guildId}] Org Info sync failed:`, err);
@@ -1273,8 +1292,8 @@ async function handleAsk(interaction) {
         const replyContent = `**Question:** "${question}"${targetNote}\n\n${qRes.answer}\n\n` +
             `*💬 **Conversation Active (2 mins):** Reply in this channel to ask follow-up questions or update tasks/notes (e.g. \`mark task ... as done\` or \`add note: ...\`). Type \`done\` to close.*`;
 
-        await interaction.editReply({
-            content: replyContent,
+        await sendSafeChunkedReply(interaction, replyContent, {
+            fileName: 'assistant_response.md',
         });
 
         // Start short-lived 2-minute message collector with frozen authorization context
@@ -1331,8 +1350,8 @@ async function handleAsk(interaction) {
                         isAdmin,
                     });
 
-                    await userMsg.reply({
-                        content: followUpRes.message,
+                    await sendSafeMessageReply(userMsg, followUpRes.message, {
+                        fileName: 'followup_response.md',
                     });
 
                     if (followUpRes.type === 'exit') {
@@ -1340,16 +1359,23 @@ async function handleAsk(interaction) {
                     }
                 } catch (fuErr) {
                     console.error('[notes:collector] Error processing follow-up:', fuErr);
+                    const safeErr = sanitizeErrorMessage(fuErr);
                     await userMsg.reply({
-                        content: `⚠️ Failed to process follow-up: ${sanitizeErrorMessage(fuErr)}`,
+                        content: `⚠️ Failed to process follow-up: ${safeErr.slice(0, 500)}`,
                     }).catch(() => {});
                 }
             });
         }
     } catch (err) {
         console.error(`[notes:ask] Error handling question:`, err);
+        const safeErr = sanitizeErrorMessage(err);
         await interaction.editReply({
-            content: `⚠️ **Assistant encountered an error:** ${sanitizeErrorMessage(err)}`,
+            content: `⚠️ **Assistant encountered an error:** ${safeErr}`,
+        }).catch(async () => {
+            await interaction.followUp({
+                content: `⚠️ **Assistant encountered an error:** ${safeErr.slice(0, 500)}`,
+                flags: MessageFlags.Ephemeral,
+            }).catch(() => {});
         });
     }
 }
@@ -1373,16 +1399,26 @@ async function handleAudit(interaction) {
         return;
     }
 
-    const rows = logs.map((l) => {
+    let rows = '';
+    let omittedLogs = 0;
+    for (const l of logs) {
         const timeStr = new Date(l.created_at).toLocaleString('en-US', { timeZone: 'UTC' });
         const targetStr = l.target_member_id ? ` (Target: <@${l.target_member_id}>)` : '';
         let detailStr = l.details || '';
         if (detailStr.length > 80) detailStr = detailStr.slice(0, 77) + '...';
-        return `• \`[${timeStr} UTC]\` <@${l.user_id}>: **${l.action}**${targetStr}\n  _${detailStr}_`;
-    }).join('\n');
+        const line = `• \`[${timeStr} UTC]\` <@${l.user_id}>: **${l.action}**${targetStr}\n  _${detailStr}_\n`;
+        if ((rows + line).length > 1600) {
+            omittedLogs++;
+        } else {
+            rows += line;
+        }
+    }
+    if (omittedLogs > 0) {
+        rows += `\n_...and ${omittedLogs} older log entries._`;
+    }
 
     await interaction.reply({
-        content: `📋 **Recent Assistant & Notion Audit Logs for ${interaction.guild.name} (Last ${logs.length}):**\n\n${rows}`,
+        content: `📋 **Recent Assistant & Notion Audit Logs for ${interaction.guild.name} (Last ${logs.length}):**\n\n${rows.trim()}`,
         flags: MessageFlags.Ephemeral,
     });
 }

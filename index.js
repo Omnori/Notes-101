@@ -4,6 +4,7 @@ require('dotenv').config({ quiet: true });
 const fs = require('node:fs');
 const path = require('node:path');
 const { Client, Collection, Events, GatewayIntentBits, MessageFlags } = require('discord.js');
+const { sanitizeErrorMessage } = require('./lib/safeError');
 let token = process.env.DISCORD_TOKEN;
 if (!token) {
     try {
@@ -66,8 +67,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await command.execute(interaction);
         } catch (error) {
             console.error(`[InteractionError:${interaction.commandName}]`, error);
-            const errorDetail = error?.message || String(error);
-            const userMessage = `**Error executing /${interaction.commandName}:** ${errorDetail}`;
+            const errorDetail = sanitizeErrorMessage(error);
+            const userMessage = `**Error executing /${interaction.commandName}:** ${errorDetail}`.slice(0, 1950);
 
             if (interaction.replied || interaction.deferred) {
                 await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -86,8 +87,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     await command.handleButton(interaction);
                 } catch (error) {
                     console.error('[ButtonError:retry_notes]', error);
-                    const errorDetail = error?.message || String(error);
-                    const userMessage = `**Retry error:** ${errorDetail}`;
+                    const errorDetail = sanitizeErrorMessage(error);
+                    const userMessage = `**Retry error:** ${errorDetail}`.slice(0, 1950);
                     if (interaction.replied || interaction.deferred) {
                         await interaction.followUp({ content: userMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
                     } else {

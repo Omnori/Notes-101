@@ -6,6 +6,12 @@ const { normalizeSection, sanitizeContent, withGuildLock, applyOrgInfoPatch, fet
 const { handleFollowUpInteraction, getOrCreateMemberPage } = require('../lib/memberAssistant');
 const { sanitizeErrorMessage } = require('../lib/safeError');
 const { handleButton } = require('../commands/utility/notes');
+const {
+    splitDiscordText,
+    truncateDiscordText,
+    sendSafeChunkedReply,
+    sendSafeMessageReply,
+} = require('../lib/discordUtils');
 
 async function runTests() {
     console.log('🚀 Starting Notes 101 Second-Pass Production Hardening & Adversarial Verification Suite...\n');
@@ -1134,6 +1140,127 @@ async function runTests() {
         await handleButton(mockInteraction);
         assert.ok(replyContent.includes('expired') || replyContent.includes('Access Denied'));
         assert.strictEqual(isEphemeral, true);
+    });
+
+    // =============================================================
+    // Area 12: Discord 2000-Character Limit & Safe Message Delivery
+    // =============================================================
+    console.log('\n--- [Area 12] Discord 2000-Character Message Limit & Safe Chunking Delivery ---');
+    test('splitDiscordText returns single chunk when text <= maxLength', () => {
+        const text = 'Hello world, this is a short response.';
+        const chunks = splitDiscordText(text, 1900);
+        assert.strictEqual(chunks.length, 1);
+        assert.strictEqual(chunks[0], text);
+    });
+
+    test('splitDiscordText cleanly splits long text (> 2000 chars) into chunks <= maxLength without data loss', () => {
+        const paragraphs = Array.from({ length: 15 }, (_, i) => `Paragraph ${i + 1}: ${'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(4)}`);
+        const fullText = paragraphs.join('\n\n');
+        assert.ok(fullText.length > 3000, 'Test input must exceed 3000 chars');
+
+        const chunks = splitDiscordText(fullText, 1900);
+        assert.ok(chunks.length >= 2, 'Must produce multiple chunks');
+        for (const chunk of chunks) {
+            assert.ok(chunk.length <= 1900, `Chunk length ${chunk.length} must not exceed 1900 chars`);
+        }
+        // Verify no content was lost
+        for (let i = 0; i < 15; i++) {
+            assert.ok(chunks.some((c) => c.includes(`Paragraph ${i + 1}:`)), `Paragraph ${i + 1} must be preserved in chunks`);
+        }
+    });
+
+    test('splitDiscordText preserves and closes/reopens fenced code blocks across chunks', () => {
+        const codeLines = Array.from({ length: 50 }, (_, i) => `    console.log('step line ${i}: ' + Math.random());`);
+        const codeText = '```javascript\n' + codeLines.join('\n') + '\n```';
+        assert.ok(codeText.length > 2500, 'Code block must exceed 2500 chars');
+
+        const chunks = splitDiscordText(codeText, 1000);
+        assert.ok(chunks.length >= 3, 'Must be split into 3+ chunks');
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            assert.ok(chunk.length <= 1000, `Chunk length ${chunk.length} must be <= 1000`);
+            const backtickCount = (chunk.match(/```/g) || []).length;
+            assert.strictEqual(backtickCount % 2, 0, `Chunk ${i} must have balanced code blocks (got ${backtickCount} delimiters)`);
+        }
+    });
+
+    test('truncateDiscordText cleanly caps long strings with ellipsis', () => {
+        const longText = 'a'.repeat(2500);
+        const truncated = truncateDiscordText(longText, 1900);
+        assert.strictEqual(truncated.length, 1900);
+        assert.ok(truncated.endsWith('...'));
+    });
+
+    await asyncTest('sendSafeChunkedReply dispatches multiple chunks via editReply and followUp without exceeding 2000 chars', async () => {
+        const sentReplies = [];
+        const sentFollowUps = [];
+        const mockInteraction = {
+            editReply: async (payload) => {
+                sentReplies.push(payload);
+            },
+            followUp: async (payload) => {
+                sentFollowUps.push(payload);
+            },
+        };
+
+        const longAnswer = Array.from({ length: 12 }, (_, i) => `Section ${i}: ${'Important organization context detail. '.repeat(6)}`).join('\n\n');
+        assert.ok(longAnswer.length > 2800, 'Answer must exceed Discord limit');
+
+        await sendSafeChunkedReply(mockInteraction, longAnswer, { fileName: 'response.md' });
+
+        assert.strictEqual(sentReplies.length, 1, 'Initial reply must be edited once');
+        assert.ok(sentReplies[0].content.length <= 1900, 'Edit reply must be <= 1900 chars');
+        assert.ok(sentFollowUps.length >= 1, 'Subsequent chunks must be sent via followUp');
+        for (const fu of sentFollowUps) {
+            assert.ok(fu.content.length <= 1900, 'Follow-up message must be <= 1900 chars');
+        }
+    });
+
+    await asyncTest('sendSafeChunkedReply attaches file for exceptionally large content (> 4 chunks)', async () => {
+        let editReplyPayload = null;
+        const mockInteraction = {
+            editReply: async (payload) => {
+                editReplyPayload = payload;
+            },
+            followUp: async () => {
+                throw new Error('Should not follow-up when attaching file for huge payload');
+            },
+        };
+
+        const massiveText = 'Huge data chunk\n'.repeat(600); // ~9600 chars, > 5 chunks
+        await sendSafeChunkedReply(mockInteraction, massiveText, { fileName: 'massive_response.md' }, 3);
+
+        assert.ok(editReplyPayload, 'Must call editReply');
+        assert.ok(editReplyPayload.content.length <= 1900, 'Preview must be <= 1900 chars');
+        assert.ok(editReplyPayload.content.includes('Full response exceeds Discord display limit'));
+        assert.ok(editReplyPayload.files && editReplyPayload.files.length > 0, 'Must include file attachment');
+    });
+
+    await asyncTest('sendSafeMessageReply delivers chunked follow-ups via reply and channel.send', async () => {
+        let replyPayload = null;
+        const channelSends = [];
+        const mockMessage = {
+            reply: async (payload) => {
+                replyPayload = payload;
+            },
+            channel: {
+                send: async (payload) => {
+                    channelSends.push(payload);
+                },
+            },
+        };
+
+        const multiChunkText = Array.from({ length: 10 }, (_, i) => `Update ${i}: ${'Task completed by member. '.repeat(15)}`).join('\n\n');
+        assert.ok(multiChunkText.length > 2200, 'Message text must exceed 2200 chars');
+
+        await sendSafeMessageReply(mockMessage, multiChunkText);
+
+        assert.ok(replyPayload, 'Initial message reply must be delivered');
+        assert.ok(replyPayload.content.length <= 1900, 'Initial reply must be <= 1900 chars');
+        assert.ok(channelSends.length >= 1, 'Remaining chunks must be delivered via channel.send');
+        for (const s of channelSends) {
+            assert.ok(s.content.length <= 1900, 'Channel send chunk must be <= 1900 chars');
+        }
     });
 
     console.log(`\n======================================================`);
