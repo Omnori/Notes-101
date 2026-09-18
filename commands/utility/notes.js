@@ -1038,7 +1038,7 @@ async function handleCreateHub(interaction) {
     await interaction.deferReply();
 
     try {
-        const orgName = interaction.options.getString('name')?.trim() || interaction.guild.name || 'Omnori';
+        const orgName = interaction.options.getString('name')?.trim() || interaction.guild?.name || 'Soren';
         const page = await createCentralWikiHub(config.notionToken, config.wikiPageId, orgName);
         const pageUrl = page.url || `https://notion.so/${page.id.replace(/-/g, '')}`;
 
@@ -1709,7 +1709,7 @@ module.exports = {
         .addSubcommand((sub) =>
             sub
                 .setName('createhub')
-                .setDescription('Generate an executive Omnori-style Central Wiki Dashboard in Notion (Admins only)')
+                .setDescription('Generate an executive Soren-style Central Wiki Dashboard in Notion (Admins only)')
                 .addStringOption((opt) =>
                     opt
                         .setName('name')

@@ -14,7 +14,7 @@ const {
 } = require('../lib/discordUtils');
 
 async function runTests() {
-    console.log('🚀 Starting Notes 101 Second-Pass Production Hardening & Adversarial Verification Suite...\n');
+    console.log('🚀 Starting Soren Second-Pass Production Hardening & Adversarial Verification Suite...\n');
     let passed = 0;
     let failed = 0;
 
@@ -124,7 +124,7 @@ async function runTests() {
     });
 
     test('sanitizeErrorMessage strips tokens, headers, and internal server filesystem paths', () => {
-        const rawError = new Error('Fetch failed at /home/yetri/Omnori/Notes101/lib/notion.js with token ntn_1234567890abcdef and header Bearer secret_xyz123');
+        const rawError = new Error('Fetch failed at /home/yetri/Soren/lib/notion.js with token ntn_1234567890abcdef and header Bearer secret_xyz123');
         const safe = sanitizeErrorMessage(rawError);
         assert.ok(!safe.includes('ntn_1234567890abcdef'), 'Token must be redacted');
         assert.ok(!safe.includes('/home/yetri'), 'Filesystem path must be redacted');
@@ -158,7 +158,7 @@ async function runTests() {
         const uuidWithHyphens = '0efc63c8-0290-8236-8d14-81577679973d';
         assert.strictEqual(normalizeNotionId(uuidWithHyphens), '0efc63c8029082368d1481577679973d');
 
-        const fullUrl = 'https://www.notion.so/workspace/Omnori-Central-Wiki-0efc63c8029082368d1481577679973d';
+        const fullUrl = 'https://www.notion.so/workspace/Soren-Central-Wiki-0efc63c8029082368d1481577679973d';
         assert.strictEqual(normalizeNotionId(fullUrl), '0efc63c8029082368d1481577679973d');
 
         const plain32 = '0efc63c8029082368d1481577679973d';
@@ -442,6 +442,10 @@ async function runTests() {
         const columnList = createdPagePayload.children.find((b) => b.type === 'column_list');
         assert.ok(columnList, 'Must include 2-column layout');
         assert.strictEqual(columnList.column_list.children.length, 2, 'Must have 2 columns');
+
+        // Verify default org name fallback to Soren
+        await createCentralWikiHub('mock_token', 'root_page_123', undefined, mockClient);
+        assert.strictEqual(createdPagePayload.properties.title[0].text.content, 'Soren Central Wiki');
     });
 
     await asyncTest('provisionWikiStructure auto-builds comprehensive executive layout on blank wiki page', async () => {
@@ -467,7 +471,7 @@ async function runTests() {
         let appendCalled = false;
         const { client, childrenStore } = createMockNotionProvisioning();
         childrenStore.set('wiki_good_root', [
-            { id: 'b1', type: 'callout', callout: { rich_text: [{ plain_text: 'Omnori Sprint Focus & Notice Board' }] } },
+            { id: 'b1', type: 'callout', callout: { rich_text: [{ plain_text: 'Soren Sprint Focus & Notice Board' }] } },
             { id: 'b2', type: 'column_list', has_children: true },
             { id: 'b3', type: 'heading_1', heading_1: { rich_text: [{ plain_text: 'Products & Media Lab' }] } },
         ]);
@@ -610,7 +614,7 @@ async function runTests() {
         assert.strictEqual(order.indexOf('A1') < order.indexOf('A2'), true, 'Tasks for the same guild must execute sequentially');
     });
 
-    test('normalizeSection maps Omnori operational categories and domains', () => {
+    test('normalizeSection maps operational categories and domains', () => {
         assert.strictEqual(normalizeSection('sprint goals and notices'), 'Sprint Focus & Priorities');
         assert.strictEqual(normalizeSection('Nori V Cam chrome extension and products'), 'Active Products & Tech Lab');
         assert.strictEqual(normalizeSection('Diyo client account & CRM'), 'Clients & Partnerships');
@@ -634,7 +638,7 @@ async function runTests() {
                                     {
                                         id: 'head-sprint',
                                         type: 'heading_1',
-                                        heading_1: { rich_text: [{ plain_text: 'Omnori Sprint Focus & Notice Board' }] },
+                                        heading_1: { rich_text: [{ plain_text: 'Soren Sprint Focus & Notice Board' }] },
                                     },
                                     {
                                         id: 'item-cam',
@@ -692,7 +696,7 @@ async function runTests() {
         };
 
         const map = await fetchCentralWikiMap(mockClient, 'root_wiki');
-        assert.ok(map.includes('# Omnori Sprint Focus & Notice Board'), 'Must include top-level heading');
+        assert.ok(map.includes('# Soren Sprint Focus & Notice Board'), 'Must include top-level heading');
         assert.ok(map.includes('1. Nori V Cam Chrome Web Store release'), 'Must include numbered item');
         assert.ok(map.includes('> [Notice] North Star Metric: 1k -> 5k users'), 'Must include callout');
         assert.ok(map.includes('## Products & Media Lab'), 'Must include child column heading');
@@ -700,7 +704,7 @@ async function runTests() {
         assert.ok(map.includes('📄 Page: Diyo growth plan'), 'Must include child page from column');
     });
 
-    await asyncTest('applyOrgInfoPatch correctly maps and adds items to Omnori canonical sections', async () => {
+    await asyncTest('applyOrgInfoPatch correctly maps and adds items to Soren canonical sections', async () => {
         const appended = [];
         const mockClient = {
             blocks: {
@@ -758,7 +762,7 @@ async function runTests() {
                                     {
                                         id: 'head-wiki',
                                         type: 'heading_1',
-                                        heading_1: { rich_text: [{ plain_text: 'Omnori Central Wiki' }] },
+                                        heading_1: { rich_text: [{ plain_text: 'Soren Central Wiki' }] },
                                     },
                                     {
                                         id: 'page-finance',
@@ -795,7 +799,7 @@ async function runTests() {
         // Test with both wikiPageId and orgInfoPageId
         const combined = await fetchOrgInfoContext('mock-token', 'org-123', 'wiki-123', mockClient);
         assert.ok(combined.includes('## CENTRAL WIKI REFERENCE & WORKSPACE MAP'), 'Must include wiki map header');
-        assert.ok(combined.includes('# Omnori Central Wiki'), 'Must include wiki heading');
+        assert.ok(combined.includes('# Soren Central Wiki'), 'Must include wiki heading');
         assert.ok(combined.includes('📄 Page: Startup Finance & Equity'), 'Must include wiki child page');
         assert.ok(combined.includes('## DYNAMIC ORG WORKING MEMORY & FACTS'), 'Must include dynamic org facts header');
         assert.ok(combined.includes('## Active Products & Tech Lab'), 'Must include org section');

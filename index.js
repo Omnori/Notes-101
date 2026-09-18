@@ -100,6 +100,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 });
 
+const { runGroundedAssistant } = require('./lib/assistantEngine');
+const { sendSafeMessageReply } = require('./lib/discordUtils');
+const { getGuildConfig } = require('./lib/guildConfig');
+
+client.on(Events.MessageCreate, async (message) => {
+    // Ignore bot messages or direct messages
+    if (message.author.bot || !message.guildId) return;
+
+    // Check if the bot was mentioned
+    if (message.mentions.has(client.user.id)) {
+        const guildId = message.guildId;
+        const config = getGuildConfig(guildId);
+
+        // Check if Notion integration is set up
+        if (!config.notionToken || !config.wikiPageId) {
+            return message.reply('Notion Integration is not configured for this server. Run `/notion setup` first.');
+        }
+
+        // Clean the message content to remove the bot mention
+        const mentionRegex = new RegExp(`<@!?${client.user.id}>`, 'g');
+        const cleanMessage = message.content.replace(mentionRegex, '').trim();
+
+        if (!cleanMessage) {
+            return message.reply('Yes? How can I help you? Ask me a question about the server wiki, e.g., "@Soren what is our PTO policy?".');
+        }
+
+        try {
+            // Trigger typing indicator
+            await message.channel.sendTyping();
+
+            // Run grounded assistant chat
+            const answer = await runGroundedAssistant(guildId, message.author.id, [
+                { role: 'user', content: cleanMessage },
+            ]);
+
+            await sendSafeMessageReply(message, answer, { fileName: 'soren_reply.md' });
+        } catch (err) {
+            console.error('[messageCreateEvent] Grounded assistant mention error:', err);
+            await message.reply(`Sorry, I encountered an error: ${err.message}`);
+        }
+    }
+});
+
 process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
