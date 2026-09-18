@@ -1,7 +1,7 @@
 const assert = require('node:assert');
 const { encrypt, decrypt, isEncrypted } = require('../lib/crypto');
 const { updateGuildConfig, getGuildConfig, sanitizeAuditDetails, logAudit, getRecentAuditLogs } = require('../lib/database');
-const { withRetry, normalizeNotionId, provisionWikiStructure } = require('../lib/notion');
+const { withRetry, normalizeNotionId, provisionWikiStructure, createCentralWikiHub } = require('../lib/notion');
 const { normalizeSection, sanitizeContent, withGuildLock, applyOrgInfoPatch, fetchCentralWikiMap, fetchOrgInfoContext } = require('../lib/orgInfoSync');
 const { handleFollowUpInteraction, getOrCreateMemberPage } = require('../lib/memberAssistant');
 const { sanitizeErrorMessage } = require('../lib/safeError');
@@ -408,6 +408,93 @@ async function runTests() {
         assert.ok(res.orgInfoPageId, 'Must successfully create Org Info page');
         assert.ok(res.actionItemsDbId, 'Must successfully create Action Items DB');
         assert.ok(res.membersDbId, 'Must successfully create Members DB');
+    });
+
+    await asyncTest('createCentralWikiHub creates multi-column executive layout, sprint callout, and registries', async () => {
+        let createdPagePayload = null;
+        const mockClient = {
+            pages: {
+                create: async (payload) => {
+                    createdPagePayload = payload;
+                    return { id: 'new-hub-id', url: 'https://notion.so/newhub' };
+                },
+            },
+        };
+
+        const res = await createCentralWikiHub('mock_token', 'root_page_123', 'Omnori', mockClient);
+        assert.strictEqual(res.id, 'new-hub-id');
+        assert.ok(createdPagePayload, 'Must call pages.create');
+        assert.strictEqual(createdPagePayload.parent.page_id, 'root_page_123');
+        assert.strictEqual(createdPagePayload.properties.title[0].text.content, 'Omnori Central Wiki');
+
+        // Verify callout banner
+        const callout = createdPagePayload.children.find((b) => b.type === 'callout');
+        assert.ok(callout, 'Must include notice board callout');
+        assert.ok(callout.callout.rich_text[0].text.content.includes('Sprint Focus & Notice Board'));
+
+        // Verify column list
+        const columnList = createdPagePayload.children.find((b) => b.type === 'column_list');
+        assert.ok(columnList, 'Must include 2-column layout');
+        assert.strictEqual(columnList.column_list.children.length, 2, 'Must have 2 columns');
+    });
+
+    await asyncTest('provisionWikiStructure auto-builds comprehensive executive layout on blank wiki page', async () => {
+        const appendedChildren = [];
+        const { client } = createMockNotionProvisioning();
+        client.blocks.children.append = async ({ children }) => {
+            appendedChildren.push(...children);
+            return { results: children };
+        };
+
+        const res = await provisionWikiStructure('mock_token', 'wiki_blank_root', {}, client);
+        assert.strictEqual(res.layoutStatus, 'created_comprehensive');
+        assert.ok(appendedChildren.length > 0, 'Must append layout blocks on blank page');
+        const hasCallout = appendedChildren.some((b) => b.type === 'callout');
+        const hasColumnList = appendedChildren.some((b) => b.type === 'column_list');
+        assert.strictEqual(hasCallout, true, 'Must include sprint notice callout');
+        assert.strictEqual(hasColumnList, true, 'Must include multi-column grid');
+        assert.ok(res.meetingsDbId, 'Must also provision Meetings DB');
+        assert.ok(res.orgInfoPageId, 'Must also provision Org Info page');
+    });
+
+    await asyncTest('provisionWikiStructure preserves 100% of existing good wiki structure without adding blocks', async () => {
+        let appendCalled = false;
+        const { client, childrenStore } = createMockNotionProvisioning();
+        childrenStore.set('wiki_good_root', [
+            { id: 'b1', type: 'callout', callout: { rich_text: [{ plain_text: 'Omnori Sprint Focus & Notice Board' }] } },
+            { id: 'b2', type: 'column_list', has_children: true },
+            { id: 'b3', type: 'heading_1', heading_1: { rich_text: [{ plain_text: 'Products & Media Lab' }] } },
+        ]);
+        client.blocks.children.append = async () => {
+            appendCalled = true;
+            return { results: [] };
+        };
+
+        const res = await provisionWikiStructure('mock_token', 'wiki_good_root', {}, client);
+        assert.strictEqual(res.layoutStatus, 'preserved_existing');
+        assert.strictEqual(appendCalled, false, 'Must NOT call append on already well-structured wiki');
+        assert.ok(res.meetingsDbId, 'Must provision missing Meetings DB');
+        assert.ok(res.orgInfoPageId, 'Must provision missing Org Info page');
+    });
+
+    await asyncTest('provisionWikiStructure augments partial wiki page with missing sprint banner', async () => {
+        const appendedChildren = [];
+        const { client, childrenStore } = createMockNotionProvisioning();
+        childrenStore.set('wiki_partial_root', [
+            { id: 'b1', type: 'heading_1', heading_1: { rich_text: [{ plain_text: 'General Project Notes' }] } },
+            { id: 'b2', type: 'paragraph', paragraph: { rich_text: [{ plain_text: 'Some existing notes from team' }] } },
+        ]);
+        client.blocks.children.append = async ({ children }) => {
+            appendedChildren.push(...children);
+            return { results: children };
+        };
+
+        const res = await provisionWikiStructure('mock_token', 'wiki_partial_root', {}, client);
+        assert.strictEqual(res.layoutStatus, 'augmented_missing_parts');
+        assert.ok(appendedChildren.length > 0, 'Must append missing sprint banner on partial page');
+        const hasCallout = appendedChildren.some((b) => b.type === 'callout');
+        assert.strictEqual(hasCallout, true, 'Must append sprint banner');
+        assert.ok(res.meetingsDbId, 'Must provision missing Meetings DB');
     });
 
     // =============================================================

@@ -37,6 +37,7 @@ const {
     provisionWikiStructure,
     publishMeetingNotes,
     getNotionClient,
+    createCentralWikiHub,
 } = require('../../lib/notion');
 const { syncOrgInfoForGuild, fetchOrgInfoContext } = require('../../lib/orgInfoSync');
 const {
@@ -857,7 +858,10 @@ async function handleSetNotion(interaction) {
     }
 
     // Auto-provision or link children under the wiki page (Meetings, Org Info, Action Items)
-    const existingConfig = getGuildConfig(guildId);
+    const existingConfig = {
+        ...getGuildConfig(guildId),
+        orgName: interaction.guild.name,
+    };
     let provision;
     try {
         provision = await provisionWikiStructure(token, validation.pageId, existingConfig);
@@ -881,10 +885,16 @@ async function handleSetNotion(interaction) {
     });
 
     const statusBadge = (isCreated) => (isCreated ? '✨ *Auto-created*' : '🔗 *Linked existing*');
+    const layoutBadge = {
+        preserved_existing: '🛡️ *Existing wiki structure preserved 100%*',
+        created_comprehensive: '✨ *Comprehensive executive Central Wiki layout auto-built*',
+        augmented_missing_parts: '🧩 *Augmented with missing operational framework & sprint board*',
+    }[provision.layoutStatus] || '🛡️ *Structure mapped*';
 
     await interaction.editReply({
-        content: `✅ **Notion Wiki Connected & Provisioned for ${interaction.guild.name}!**\n` +
+        content: `✅ **Notion Wiki Connected & Intelligently Provisioned for ${interaction.guild.name}!**\n` +
             `- **Wiki Root:** **${validation.title}** (\`${validation.pageId}\`)\n` +
+            `- **Central Wiki Structure:** ${layoutBadge}\n` +
             `- **Notion Token:** ${maskToken(token)}\n\n` +
             `**Provisioned Entities:**\n` +
             `- 📅 **Meetings Database:** \`${provision.meetingsDbId}\` ${statusBadge(provision.created.meetings)}\n` +
@@ -958,7 +968,11 @@ async function handleNotionProvision(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
-        const provision = await provisionWikiStructure(config.notionToken, config.wikiPageId, config);
+        const configWithOrg = {
+            ...config,
+            orgName: interaction.guild.name,
+        };
+        const provision = await provisionWikiStructure(config.notionToken, config.wikiPageId, configWithOrg);
 
         setGuildNotionConfig(guildId, {
             notionToken: config.notionToken,
@@ -970,9 +984,15 @@ async function handleNotionProvision(interaction) {
         });
 
         const statusBadge = (isCreated) => (isCreated ? '✨ *Auto-created*' : '🔗 *Linked existing*');
+        const layoutBadge = {
+            preserved_existing: '🛡️ *Existing wiki structure preserved 100%*',
+            created_comprehensive: '✨ *Comprehensive executive Central Wiki layout auto-built*',
+            augmented_missing_parts: '🧩 *Augmented with missing operational framework & sprint board*',
+        }[provision.layoutStatus] || '🛡️ *Structure mapped*';
 
         await interaction.editReply({
             content: `**Notion Wiki Provisioning for ${interaction.guild.name}:**\n\n` +
+                `- **Central Wiki Structure:** ${layoutBadge}\n` +
                 `**Entities:**\n` +
                 `- 📅 **Meetings Database:** ${statusBadge(provision.created.meetings)}\n` +
                 `- 🏢 **Org Info Page:** ${statusBadge(provision.created.orgInfo)}\n` +
@@ -983,6 +1003,52 @@ async function handleNotionProvision(interaction) {
         console.error(`[notes:${guildId}] Notion provisioning failed:`, err);
         await interaction.editReply({
             content: `⚠️ **Provisioning failed:** ${sanitizeErrorMessage(err)}`,
+        });
+    }
+}
+
+async function handleCreateHub(interaction) {
+    const guildId = interaction.guildId;
+    if (!checkAdminPermission(interaction)) {
+        await interaction.reply({
+            content: 'You need the Manage Server permission or be the Server Owner to create a Central Wiki Hub.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const config = getGuildConfig(guildId);
+    if (!config.notionToken || !config.wikiPageId) {
+        await interaction.reply({
+            content: 'Notion is not configured for this server yet. Use `/notes setnotion token:<token> wiki:<page_id>` first.',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+        const orgName = interaction.options.getString('name')?.trim() || interaction.guild.name || 'Omnori';
+        const page = await createCentralWikiHub(config.notionToken, config.wikiPageId, orgName);
+        const pageUrl = page.url || `https://notion.so/${page.id.replace(/-/g, '')}`;
+
+        await interaction.editReply({
+            content: `🏛️ **Executive Central Wiki Hub Created Successfully!**\n\n` +
+                `- **Title:** **${orgName} Central Wiki**\n` +
+                `- **Notion URL:** [Open in Notion](${pageUrl})\n\n` +
+                `**Architecture & Layout:**\n` +
+                `• 📢 **Executive Callout Banner**: Notice Board, Active Sprint Focus & North Star Metric\n` +
+                `• 🏛️ **2-Column Workspace Grid**:\n` +
+                `  - **Column 1**: Strategy & Philosophy, Leadership, Capital & Startup Finance (≤5% dilution rule), Agency Services, Brand Assets\n` +
+                `  - **Column 2**: Products & Tech Lab (Nori V Cam), Strategic Partnerships, Client Accounts & CRM (Diyo, Kaapi), Public Website & Roster\n` +
+                `• 🗄️ **Master Registries**: Connected with Meetings DB, Action Items DB, Members DB, and Living Org Memory\n\n` +
+                `Anyone reviewing this Notion page can now immediately understand your entire organization at a glance!`,
+        });
+    } catch (err) {
+        console.error(`[notes:${guildId}] Failed to create Central Wiki Hub:`, err);
+        await interaction.editReply({
+            content: `⚠️ **Failed to create Central Wiki Hub:** ${sanitizeErrorMessage(err)}`,
         });
     }
 }
@@ -1606,6 +1672,17 @@ module.exports = {
         )
         .addSubcommand((sub) =>
             sub
+                .setName('createhub')
+                .setDescription('Generate an executive Omnori-style Central Wiki Dashboard in Notion (Admins only)')
+                .addStringOption((opt) =>
+                    opt
+                        .setName('name')
+                        .setDescription('Organization name for the Central Wiki (default: server name)')
+                        .setRequired(false),
+                ),
+        )
+        .addSubcommand((sub) =>
+            sub
                 .setName('syncmode')
                 .setDescription('Toggle Org Info sync mode between automatic and manual (Admins only)')
                 .addStringOption((opt) =>
@@ -1673,6 +1750,7 @@ module.exports = {
         if (sub === 'notioninfo') return handleNotionInfo(interaction);
         if (sub === 'clearnotion') return handleClearNotion(interaction);
         if (sub === 'notionprovision') return handleNotionProvision(interaction);
+        if (sub === 'createhub') return handleCreateHub(interaction);
         if (sub === 'syncmode') return handleSyncMode(interaction);
         if (sub === 'sync') return handleSync(interaction);
         if (sub === 'ask') return handleAsk(interaction);
