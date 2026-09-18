@@ -56,11 +56,11 @@ Discord voice (48kHz stereo Opus)
 
 ## Slash Commands
 
-| Command | Description |
-| --- | --- |
-| `/notes start` | Joins your voice channel and starts transcribing |
-| `/notes stop` | Stops transcribing, summarizes via AI, and posts the notes |
-| `/notes setkey` | Sets Groq / Gemini API keys for the server (Admin only, ephemeral response) |
-| `/notes keyinfo` | View API key status for the server |
-| `/notes clearkey` | Clear API keys saved for the server |
-| `/notes channel [channel]` | View or set which text channel notes get posted to (needs Manage Channels) |
+| Command                    | Description                                                                 |
+| ----------------------------| -----------------------------------------------------------------------------|
+| `/notes start`             | Joins your voice channel and starts transcribing                            |
+| `/notes stop`              | Stops transcribing, summarizes via AI, and posts the notes                  |
+| `/notes setkey`            | Sets Groq / Gemini API keys for the server (Admin only, ephemeral response) |
+| `/notes keyinfo`           | View API key status for the server                                          |
+| `/notes clearkey`          | Clear API keys saved for the server                                         |
+| `/notes channel [channel]` | View or set which text channel notes get posted to (needs Manage Channels)  |
