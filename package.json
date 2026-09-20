@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/verify_hardening.js",
+    "test": "node test/verify_hardening.js && node test/verify_help.js",
     "lint": "eslint ."
   },
   "keywords": [],

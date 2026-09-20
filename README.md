@@ -250,11 +250,16 @@ Now Soren is fully grounded and ready!
 | `/notes channel` | Voice & Meetings | `channel` | Configures which text channel Soren should post meeting summaries to. |
 | `/notes start` | Voice & Meetings | None | Summons Soren to your current voice channel to start real-time transcription. |
 | `/notes stop` | Voice & Meetings | None | Directs Soren to leave the channel, compile the transcript, and post a structured meeting report. |
+| `/join` | Voice & Meetings | None | Connects Soren to your current voice channel. |
+| `/leave` | Voice & Meetings | None | Disconnects Soren from the current voice channel. |
 | `/notion setup` | Notion Integration | `token`, `wiki` | Links Soren with your Notion integration token and root Central Wiki page. |
 | `/notion scan` | Notion Integration | None | Triggers a full, recursive workspace scan to refresh the FTS5 search index. |
 | `/notion status` | Notion Integration | None | Displays cache statistics, total mapped pages, and last scan timestamps. |
 | `/notion link-member` | Notion Integration | `member`, `notion_name` | Connects a Discord server member to their Notion account profile. |
 | `/ask` | Workspace Search | `question` | Directly queries Soren's local full-text search index using AI-driven context grounding. |
+| `/ping` | Diagnostics | None | Latency check, gateway test, and profile display. |
+| `/restart` | Administration | None | Restarts the bot process (Admin only). |
+| `/help` | Reference & Documentation | `command`, `subcommand` | Displays UNIX man page style reference manuals for all commands. |
 
 ---
 
